@@ -61,6 +61,13 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   const tokenService = userPassword ? new TapeTokenService(jwtSecret) : null;
   const revokedRefreshTokens = new Set<string>();
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
+  app.addHook('onResponse', async (request, reply) => {
+    const routeOrPath = request.routeOptions.url ?? request.url.split('?')[0];
+    if (routeOrPath.startsWith(`${tapeApiPrefix}/auth/`)) {
+      // Do not log request bodies, headers, credentials, tokens, or query parameters.
+      console.info(`[Tape auth diagnostic] ${request.method} ${routeOrPath} -> ${reply.statusCode}`);
+    }
+  });
   let recommendationCache: { expiresAt: number; tracks: Track[] } | null = null;
 
   async function recommendationPool(): Promise<Track[]> {
