@@ -133,6 +133,9 @@ describe('Tape-compatible SoundCloud server', () => {
     const directory = await makeTempDirectory();
     app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, tapeDataDir: directory, ...tapeAuth });
     assert.equal((await app.inject({ method: 'GET', url: '/api/v1/library/liked' })).statusCode, 401);
+    const loginProbe = await app.inject({ method: 'GET', url: '/api/v1/auth/login' });
+    assert.equal(loginProbe.statusCode, 405);
+    assert.equal(loginProbe.headers.allow, 'POST');
 
     const publicSignup = await app.inject({
       method: 'POST', url: '/api/v1/auth/register',

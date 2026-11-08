@@ -1,6 +1,6 @@
 {
   "name": "@tape/music-streamer",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "description": "Tape Server API adapter for SoundCloud search, playback, and likes",
   "type": "module",
   "main": "./dist/index.js",

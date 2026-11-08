@@ -140,6 +140,11 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     };
   });
 
+  // Tape probes GET /auth/login to discover whether password sign-in is offered.
+  // Return 405 (route exists, but requires POST) instead of Fastify's default 404.
+  app.get(`${tapeApiPrefix}/auth/login`, async (_request, reply) =>
+    reply.header('allow', 'POST').code(405).send({ error: 'Use POST with email and password to sign in.' }));
+
   app.post<{ Body: LoginBody }>(`${tapeApiPrefix}/auth/login`, async (request, reply) => {
     if (!tokenService) return reply.code(503).send({ error: 'Set TAPE_USER_PASSWORD and a 32+ character TAPE_JWT_SECRET to enable Tape sign-in.' });
     const email = typeof request.body?.email === 'string' ? request.body.email.trim().toLowerCase() : '';

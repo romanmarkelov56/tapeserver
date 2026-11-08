@@ -30,7 +30,7 @@ TAPE_JWT_SECRET=отдельный_случайный_секрет_миниму�
 TAPE_DATA_DIR=./data
 ```
 
-Секрет можно создать командой `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"`. В Tape нужно выполнить **вход** с тем же email и паролем. Для совместимости Tape маршрут регистрации существует, но он выдаёт сессию только для заранее заданной учётной записи владельца; публичные аккаунты создать нельзя. Это локальный вход Tape, не авторизация SoundCloud. Если пароль/JWT-секрет не заданы, сервер не запускается. Осознанный анонимный режим включается только явно: `TAPE_REQUIRE_AUTH=false`.
+Секрет можно создать командой `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"`. В Tape нужно выполнить **вход** с тем же email и паролем. Tape проверяет доступность email-входа запросом `GET /api/v1/auth/login`; сервер отвечает `405 Method Not Allowed` (маршрут существует, но учётные данные принимаются только методом POST). Для совместимости Tape маршрут регистрации существует, но он выдаёт сессию только для заранее заданной учётной записи владельца; публичные аккаунты создать нельзя. Это локальный вход Tape, не авторизация SoundCloud. Если пароль/JWT-секрет не заданы, сервер не запускается. Осознанный анонимный режим включается только явно: `TAPE_REQUIRE_AUTH=false`.
 
 `SOUNDCLOUD_CLIENT_ID` можно оставить пустым, если он извлекается из JWT. SoundCloud OAuth-токен хранится только на сервере в `.env` — в Tape его вводить не нужно. `data/` содержит локальные избранные треки и историю; оба файла исключены из проекта/архива.
 
@@ -54,7 +54,7 @@ tailscale serve --bg 8787
 ## Основные маршруты
 
 - `GET /api/v1/public/stats` — проверка подключения и домашняя полка новинок.
-- `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me` — локальная сессия Tape.
+- `GET /api/v1/auth/login` — обнаружение доступности email-входа (ответ 405); `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me` — локальная сессия Tape.
 - `GET /api/v1/library/search?q=...` — совместный поиск треков, исполнителей и релизов.
 - `GET /api/v1/library/artists`, `GET /api/v1/library/artists/{id}`, `GET /api/v1/library/artists/{id}/top-tracks` — каталог, профиль и топ-треки исполнителя.
 - `GET /api/v1/library/albums/{id}` — детали альбома/плейлиста и треклист.
