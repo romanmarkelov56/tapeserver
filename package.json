@@ -1,0 +1,31 @@
+{
+  "name": "@tape/music-streamer",
+  "version": "2.2.1",
+  "description": "Tape Server API adapter for SoundCloud search, playback, and likes",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "keywords": [
+    "tape",
+    "music",
+    "soundcloud",
+    "streaming",
+    "likes"
+  ],
+  "license": "MIT"
+}
