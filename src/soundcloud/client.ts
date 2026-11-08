@@ -1,0 +1,352 @@
+import type { Track, SearchParams, Artist, Album } from '../types.js';
+
+type FetchLike = typeof fetch;
+type RawTrack = Record<string, any>;
+
+export class SoundCloudApiError extends Error {
+  constructor(message: string, readonly statusCode: number) {
+    super(message);
+    this.name = 'SoundCloudApiError';
+  }
+}
+
+/** SoundCloud adapter. Signed media URLs are resolved per request and never cached. */
+export class SoundCloudClient {
+  private readonly apiBaseUrl: string;
+  private readonly apiV2BaseUrl: string;
+  private readonly clientId: string;
+  private readonly accessToken?: string;
+  private readonly request: FetchLike;
+
+  constructor(
+    clientId = '',
+    accessToken?: string,
+    request: FetchLike = fetch,
+    options: { apiBaseUrl?: string; apiV2BaseUrl?: string } = {},
+  ) {
+    this.clientId = clientId || clientIdFromToken(accessToken);
+    this.accessToken = accessToken;
+    this.request = request;
+    this.apiBaseUrl = options.apiBaseUrl ?? 'https://api.soundcloud.com';
+    this.apiV2BaseUrl = options.apiV2BaseUrl ?? 'https://api-v2.soundcloud.com';
+  }
+
+  async searchTracks(params: SearchParams): Promise<Track[]> {
+    const query = params.query.trim();
+    if (!query) throw new Error('Search query must not be empty');
+    const limit = clampInteger(params.limit, 20, 1, 50);
+    const offset = clampInteger(params.offset, 0, 0, 10_000);
+    const url = this.withClientId(new URL('/search/tracks', this.apiV2BaseUrl));
+    url.searchParams.set('q', query);
+    url.searchParams.set('limit', String(limit));
+    url.searchParams.set('offset', String(offset));
+    url.searchParams.set('access', 'playable');
+
+    let response: Response;
+    try {
+      response = await this.request(url, { headers: this.headers() });
+    } catch {
+      throw new SoundCloudApiError('Unable to reach SoundCloud API', 502);
+    }
+    if (!response.ok && [400, 404, 410, 422].includes(response.status)) {
+      const legacy = this.withClientId(new URL('/tracks', this.apiBaseUrl));
+      legacy.searchParams.set('q', query);
+      legacy.searchParams.set('limit', String(limit));
+      legacy.searchParams.set('offset', String(offset));
+      legacy.searchParams.set('access', 'playable');
+      legacy.searchParams.set('linked_partitioning', 'true');
+      response = await this.request(legacy, { headers: this.headers() });
+    }
+    if (!response.ok) throw await this.toApiError(response);
+    const body = await response.json() as { collection?: RawTrack[] } | RawTrack[];
+    const tracks = Array.isArray(body) ? body : body.collection ?? [];
+    return tracks.map((item) => this.mapTrack(item)).filter((item): item is Track => item !== null);
+  }
+
+  async searchArtists(params: SearchParams): Promise<Artist[]> {
+    const items = await this.searchEntities('users', params);
+    return items.filter((item) => safeCount(item.track_count ?? item.tracks_count) > 0
+      || safeCount(item.playlist_count ?? item.playlists_count) > 0 || item.verified === true)
+      .map((item) => this.mapArtist(item)).filter((item): item is Artist => item !== null);
+  }
+
+  async searchAlbums(params: SearchParams): Promise<Album[]> {
+    const items = await this.searchEntities('playlists', params);
+    return items.map((item) => this.mapAlbum(item)).filter((item): item is Album => item !== null);
+  }
+
+  async getArtistById(artistId: string): Promise<Artist> {
+    const id = validateTrackId(artistId);
+    const raw = await this.getJson(`/users/${encodeURIComponent(id)}`);
+    const artist = this.mapArtist(raw);
+    if (!artist) throw new SoundCloudApiError('SoundCloud returned an invalid artist resource', 502);
+    const [rawAlbums, tracks] = await Promise.all([
+      this.getCollection(`/users/${encodeURIComponent(id)}/playlists`, { limit: '50', show_tracks: 'false' }).catch(() => []),
+      this.getArtistTracks(id, 50).catch(() => []),
+    ]);
+    artist.albums = rawAlbums.map((item) => this.mapAlbum(item)).filter((item): item is Album => item !== null);
+    artist.tracks = tracks;
+    return artist;
+  }
+
+  async getArtistTracks(artistId: string, limit = 50): Promise<Track[]> {
+    const id = validateTrackId(artistId);
+    const items = await this.getCollection(`/users/${encodeURIComponent(id)}/tracks`, { limit: String(clampInteger(limit, 50, 1, 200)), access: 'playable' });
+    const tracks = items.map((item) => this.mapTrack(item)).filter((item): item is Track => item !== null);
+    if (tracks.length > 0) return tracks;
+    const user = this.mapArtist(await this.getJson(`/users/${encodeURIComponent(id)}`));
+    if (!user) return [];
+    const searchResults = await this.searchTracks({ query: user.name, limit: clampInteger(limit, 50, 1, 50), offset: 0 });
+    return searchResults.filter((track) => track.artistId === id || track.artist.toLowerCase() === user.name.toLowerCase());
+  }
+
+  async getRelatedTracks(trackId: string, limit = 30): Promise<Track[]> {
+    const id = validateTrackId(trackId);
+    const items = await this.getCollection(`/tracks/${encodeURIComponent(id)}/related`, {
+      limit: String(clampInteger(limit, 30, 1, 50)),
+      access: 'playable',
+    });
+    return items.map((item) => this.mapTrack(item)).filter((item): item is Track => item !== null);
+  }
+
+  async getAlbumById(albumId: string): Promise<Album> {
+    const id = validateTrackId(albumId);
+    const raw = await this.getJson(`/playlists/${encodeURIComponent(id)}`, { show_tracks: 'true' });
+    const album = this.mapAlbum(raw);
+    if (!album) throw new SoundCloudApiError('SoundCloud returned an invalid playlist resource', 502);
+    album.tracks = (Array.isArray(raw.tracks) ? raw.tracks : []).map((item: RawTrack) => this.mapTrack(item)).filter((item: Track | null): item is Track => item !== null);
+    album.trackCount = Number(raw.track_count) || album.tracks.length;
+    return album;
+  }
+
+  async getTrackById(trackId: string): Promise<Track> {
+    const id = validateTrackId(trackId);
+    let response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiV2BaseUrl)), {
+      headers: this.headers(),
+    });
+    if (!response.ok && [400, 404, 410, 422].includes(response.status)) {
+      response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiBaseUrl)), {
+        headers: this.headers(),
+      });
+    }
+    if (!response.ok) throw await this.toApiError(response);
+    const track = this.mapTrack(await response.json() as RawTrack);
+    if (!track) throw new SoundCloudApiError('SoundCloud returned an invalid track resource', 502);
+    return track;
+  }
+
+  /** Resolve one playable transcoding. Do not expose its signed URL to clients. */
+  async getStreamUrl(trackId: string): Promise<string> {
+    const id = validateTrackId(trackId);
+    let response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiV2BaseUrl)), {
+      headers: this.headers(),
+    });
+    let rawTrack: RawTrack;
+    if (response.ok) {
+      rawTrack = await response.json() as RawTrack;
+    } else if ([400, 404, 410, 422].includes(response.status)) {
+      response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiBaseUrl)), {
+        headers: this.headers(),
+      });
+      if (!response.ok) throw await this.toApiError(response);
+      rawTrack = await response.json() as RawTrack;
+    } else {
+      throw await this.toApiError(response);
+    }
+
+    if (rawTrack.access === 'blocked' || rawTrack.streamable === false) {
+      throw new SoundCloudApiError('This track is not available for streaming', 403);
+    }
+    const transcodings: Array<Record<string, any>> = Array.isArray(rawTrack.media?.transcodings)
+      ? rawTrack.media.transcodings : [];
+    const candidates = transcodings
+      .filter((item) => typeof item.url === 'string' && ['hls', 'progressive'].includes(item.format?.protocol))
+      .sort((a, b) => Number(a.format.protocol === 'hls') - Number(b.format.protocol === 'hls'));
+
+    for (const candidate of candidates) {
+      try {
+        const resolveUrl = this.withClientId(new URL(candidate.url));
+        const resolved = await this.request(resolveUrl, { headers: this.headers(), redirect: 'manual' });
+        if (resolved.status >= 300 && resolved.status < 400) {
+          const location = resolved.headers.get('location');
+          if (location) return this.validateMediaUrl(new URL(location, resolveUrl).toString());
+        }
+        if (resolved.ok) {
+          const payload = await resolved.json().catch(() => null) as { url?: string } | null;
+          if (payload?.url) return this.validateMediaUrl(payload.url);
+        }
+      } catch {
+        // Signed URLs are sensitive; try the next transcoding without logging details.
+      }
+    }
+
+    // Documented API compatibility path: this endpoint responds with a redirect.
+    const streamUrl = this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}/stream`, this.apiBaseUrl));
+    const streamResponse = await this.request(streamUrl, { headers: this.headers(), redirect: 'manual' });
+    if (streamResponse.status >= 300 && streamResponse.status < 400) {
+      const location = streamResponse.headers.get('location');
+      if (location) return this.validateMediaUrl(new URL(location, streamUrl).toString());
+    }
+    if (!streamResponse.ok) throw await this.toApiError(streamResponse);
+    const payload = await streamResponse.json().catch(() => null) as { url?: string } | null;
+    if (payload?.url) return this.validateMediaUrl(payload.url);
+    throw new SoundCloudApiError('No playable SoundCloud transcoding is available for this track', 403);
+  }
+
+  private headers(): Headers {
+    const headers = new Headers({ Accept: 'application/json' });
+    if (this.accessToken) headers.set('Authorization', `OAuth ${this.accessToken}`);
+    return headers;
+  }
+
+  private withClientId(url: URL): URL {
+    if (this.clientId) url.searchParams.set('client_id', this.clientId);
+    return url;
+  }
+
+  private async searchEntities(kind: 'users' | 'playlists', params: SearchParams): Promise<RawTrack[]> {
+    const query = params.query.trim();
+    if (!query) throw new Error('Search query must not be empty');
+    const limit = clampInteger(params.limit, 20, 1, 50);
+    const offset = clampInteger(params.offset, 0, 0, 10_000);
+    return this.getCollection(`/search/${kind}`, { q: query, limit: String(limit), offset: String(offset) }, `/${kind}`);
+  }
+
+  private async getCollection(path: string, params: Record<string, string> = {}, fallbackPath = path): Promise<RawTrack[]> {
+    const body = await this.getJson(path, params, fallbackPath);
+    if (Array.isArray(body)) return body as RawTrack[];
+    return Array.isArray(body?.collection) ? body.collection as RawTrack[] : [];
+  }
+
+  private async getJson(path: string, params: Record<string, string> = {}, fallbackPath = path): Promise<RawTrack> {
+    const url = this.withClientId(new URL(path, this.apiV2BaseUrl));
+    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    let response = await this.request(url, { headers: this.headers() });
+    if (!response.ok && [400, 404, 410, 422].includes(response.status)) {
+      const fallback = this.withClientId(new URL(fallbackPath, this.apiBaseUrl));
+      for (const [key, value] of Object.entries(params)) fallback.searchParams.set(key, value);
+      fallback.searchParams.set('linked_partitioning', 'true');
+      response = await this.request(fallback, { headers: this.headers() });
+    }
+    if (!response.ok) throw await this.toApiError(response);
+    return await response.json() as RawTrack;
+  }
+
+  private mapArtist(item: RawTrack): Artist | null {
+    if (item?.id === undefined || item?.id === null) return null;
+    const name = item.username ?? item.full_name ?? [item.first_name, item.last_name].filter(Boolean).join(' ') ?? 'Unknown Artist';
+    return {
+      id: String(item.id),
+      name: String(name).trim() || 'Unknown Artist',
+      ...(typeof item.description === 'string' ? { biography: item.description } : {}),
+      ...(typeof item.avatar_url === 'string' ? { artworkUrl: item.avatar_url.replace(/^http:/, 'https:') } : {}),
+      followersCount: safeCount(item.followers_count ?? item.follower_count),
+      monthlyListeners: safeCount(item.monthly_listeners),
+      albums: [],
+      tracks: [],
+    };
+  }
+
+  private mapAlbum(item: RawTrack): Album | null {
+    if (item?.id === undefined || item?.id === null || !item?.title) return null;
+    const rawTracks = Array.isArray(item.tracks) ? item.tracks : [];
+    const tracks = rawTracks.map((track: RawTrack) => this.mapTrack(track)).filter((track: Track | null): track is Track => track !== null);
+    const trackCount = safeCount(item.track_count) || tracks.length;
+    const setType = String(item.release_type ?? item.set_type ?? '').toLowerCase();
+    const releaseType: Album['releaseType'] = item.is_album || setType === 'album' ? 'album' : trackCount <= 1 ? 'single' : 'ep';
+    const createdAt = typeof item.created_at === 'string' ? Date.parse(item.created_at) : NaN;
+    const year = Number.isFinite(createdAt) ? new Date(createdAt).getUTCFullYear() : undefined;
+    const artistName = item.user?.username ?? item.user?.full_name ?? item.publisher_metadata?.artist ?? item.artist ?? 'Unknown Artist';
+    const artistId = item.user?.id ?? item.user_id ?? item.creator?.id ?? item.id;
+    const artwork = item.artwork_url ?? item.user?.avatar_url;
+    return {
+      id: String(item.id),
+      title: String(item.title).trim() || 'Untitled release',
+      artistId: String(artistId),
+      artist: String(artistName).trim() || 'Unknown Artist',
+      ...(typeof artwork === 'string' ? { artworkUrl: artwork.replace(/^http:/, 'https:') } : {}),
+      ...(year ? { year } : {}),
+      trackCount,
+      releaseType,
+      tracks,
+    };
+  }
+
+  private mapTrack(item: RawTrack): Track | null {
+    if (item?.id === undefined || item?.id === null || !item?.title) return null;
+    const artist = item.user?.username ?? item.publisher_metadata?.artist ?? item.artist ?? 'Unknown Artist';
+    const artwork = item.artwork_url ?? item.user?.avatar_url;
+    const bpm = positiveNumber(item.bpm ?? item.metadata?.bpm ?? item.publisher_metadata?.bpm);
+    const albumId = item.album?.id ?? item.playlist?.id;
+    return {
+      id: String(item.id),
+      title: String(item.title).trim() || 'Unknown Track',
+      artist: String(artist).trim() || 'Unknown Artist',
+      // SoundCloud API track.duration is already expressed in milliseconds.
+      durationMs: Number.isFinite(Number(item.duration)) ? Math.max(0, Number(item.duration)) : 0,
+      permalinkUrl: typeof item.permalink_url === 'string' ? item.permalink_url : '',
+      artworkUrl: typeof artwork === 'string' ? artwork.replace(/^http:/, 'https:') : undefined,
+      artistId: item.user?.id !== undefined ? String(item.user.id) : undefined,
+      artistArtworkUrl: typeof item.user?.avatar_url === 'string' ? item.user.avatar_url.replace(/^http:/, 'https:') : undefined,
+      ...(albumId === undefined ? {} : { albumId: String(albumId) }),
+      albumTitle: String(item.publisher_metadata?.release_title ?? item.album?.title ?? 'Singles'),
+      playbackCount: Number.isFinite(Number(item.playback_count)) ? Math.max(0, Number(item.playback_count)) : 0,
+      ...(bpm === undefined ? {} : { bpm }),
+      access: typeof item.access === 'string' ? item.access : undefined,
+      streamable: typeof item.streamable === 'boolean' ? item.streamable : undefined,
+    };
+  }
+
+  private validateMediaUrl(rawUrl: string): string {
+    let url: URL;
+    try { url = new URL(rawUrl); } catch { throw new SoundCloudApiError('SoundCloud returned an invalid media URL', 502); }
+    const host = url.hostname.toLowerCase();
+    const trusted = host === 'soundcloud.com' || host.endsWith('.soundcloud.com') || host === 'sndcdn.com' || host.endsWith('.sndcdn.com') || host === 'soundcloud.cloud' || host.endsWith('.soundcloud.cloud');
+    if (url.protocol !== 'https:' || !trusted || url.username || url.password) {
+      throw new SoundCloudApiError('SoundCloud returned an untrusted media URL', 502);
+    }
+    return url.toString();
+  }
+
+  private async toApiError(response: Response): Promise<SoundCloudApiError> {
+    const message: Record<number, string> = {
+      400: 'SoundCloud rejected the request',
+      401: 'SoundCloud authentication failed; check the access token',
+      403: 'SoundCloud denied access to this resource',
+      404: 'SoundCloud resource was not found',
+      429: 'SoundCloud rate limit reached; retry later',
+    };
+    return new SoundCloudApiError(message[response.status] ?? `SoundCloud API request failed (${response.status})`, response.status);
+  }
+}
+
+function validateTrackId(value: string): string {
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(value)) throw new Error('Invalid SoundCloud track ID');
+  return value;
+}
+
+function clampInteger(value: number | undefined, fallback: number, min: number, max: number): number {
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(parsed)) throw new Error('Pagination values must be integers');
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= 500 ? parsed : undefined;
+}
+
+function safeCount(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function clientIdFromToken(token?: string): string {
+  if (!token) return '';
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as { client_id?: unknown };
+    return typeof payload.client_id === 'string' ? payload.client_id : '';
+  } catch {
+    return '';
+  }
+}

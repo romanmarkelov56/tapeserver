@@ -1,0 +1,606 @@
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { Readable } from 'node:stream';
+import { config as defaultConfig } from './config.js';
+import { SoundCloudApiError, SoundCloudClient } from './soundcloud/client.js';
+import { JsonFavoritesStore, type FavoritesStore, type TapeLikedTrack } from './favorites-store.js';
+import { JsonPlayHistoryStore, type PlayHistoryStore, type TapeHistoryTrack } from './history-store.js';
+import type { Track, Artist, Album } from './types.js';
+import { TapeTokenService, type TapeSessionClaims } from './tape-auth.js';
+
+type TapeSoundCloudClient = Pick<SoundCloudClient,
+  'searchTracks' | 'searchArtists' | 'searchAlbums' | 'getArtistById' | 'getArtistTracks' | 'getRelatedTracks' | 'getAlbumById' | 'getTrackById' | 'getStreamUrl'>;
+
+export interface ServerConfig {
+  soundCloudClientId?: string;
+  soundCloudAccessToken?: string;
+  tapeUserEmail?: string;
+  tapeUserPassword?: string;
+  tapeJwtSecret?: string;
+  tapeDataDir?: string;
+  tapeRequireAuth?: boolean;
+  historyStore?: PlayHistoryStore;
+  host?: string;
+  port?: number;
+  /** Set false when using Fastify.inject() in tests. */
+  listen?: boolean;
+  soundCloudClient?: TapeSoundCloudClient;
+  mediaFetch?: typeof fetch;
+  favoritesStore?: FavoritesStore;
+}
+
+type SearchQuery = { q?: string; limit?: string | number; offset?: string | number };
+type TrackParams = { id: string };
+type TrackIdParams = { track_id: string };
+type CoverParams = { id: string };
+type StreamQuery = { token?: string };
+type LoginBody = { email?: string; password?: string };
+type RefreshBody = { refresh_token?: string };
+type PlayBody = { track_id?: string | number };
+
+const tapeApiPrefix = '/api/v1';
+const authFailure = { error: 'Authentication required.' };
+
+export async function createMusicStreamerServer(options: ServerConfig = {}): Promise<FastifyInstance> {
+  const host = options.host ?? defaultConfig.host;
+  const port = options.port ?? defaultConfig.port;
+  const userEmail = options.tapeUserEmail ?? defaultConfig.tapeUserEmail;
+  const userPassword = options.tapeUserPassword ?? defaultConfig.tapeUserPassword;
+  const jwtSecret = options.tapeJwtSecret ?? defaultConfig.tapeJwtSecret;
+  const requireAuth = options.tapeRequireAuth ?? defaultConfig.tapeRequireAuth;
+  const dataDir = options.tapeDataDir ?? defaultConfig.tapeDataDir;
+  const favorites = options.favoritesStore ?? new JsonFavoritesStore(dataDir);
+  const history = options.historyStore ?? new JsonPlayHistoryStore(dataDir);
+  const client = options.soundCloudClient ?? new SoundCloudClient(
+    options.soundCloudClientId ?? defaultConfig.soundCloudClientId,
+    options.soundCloudAccessToken ?? defaultConfig.soundCloudAccessToken,
+  );
+  const mediaFetch = options.mediaFetch ?? fetch;
+  if (requireAuth && !userPassword) throw new Error('Set TAPE_USER_PASSWORD and TAPE_JWT_SECRET before starting; Tape authentication is required by default.');
+  if (userPassword && userPassword.length < 8) throw new Error('TAPE_USER_PASSWORD must contain at least 8 characters');
+  const tokenService = userPassword ? new TapeTokenService(jwtSecret) : null;
+  const revokedRefreshTokens = new Set<string>();
+  const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
+  let recommendationCache: { expiresAt: number; tracks: Track[] } | null = null;
+
+  async function recommendationPool(): Promise<Track[]> {
+    if (recommendationCache && recommendationCache.expiresAt > Date.now()) return recommendationCache.tracks;
+    const queries = ['lofi', 'chill', 'ambient', 'indie', 'jazz', 'electronic', 'house', 'hip hop'];
+    for (let i = queries.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [queries[i], queries[j]] = [queries[j], queries[i]];
+    }
+    const tracks = new Map<string, Track>();
+    for (const query of queries.slice(0, 3)) {
+      try {
+        for (const track of await client.searchTracks({ query, limit: 50, offset: 0 })) tracks.set(track.id, track);
+      } catch { /* Try another discovery term if SoundCloud has a gap or a query is restricted. */ }
+    }
+    if (tracks.size === 0) {
+      try { for (const track of await client.searchTracks({ query: 'music', limit: 50, offset: 0 })) tracks.set(track.id, track); }
+      catch { /* Return an empty fallback only when SoundCloud is unreachable. */ }
+    }
+    recommendationCache = { tracks: [...tracks.values()], expiresAt: Date.now() + (tracks.size ? 3 : 0.25) * 60_000 };
+    return recommendationCache.tracks;
+  }
+
+  let albumCache: { expiresAt: number; albums: Album[] } | null = null;
+  async function albumPool(): Promise<Album[]> {
+    if (albumCache && albumCache.expiresAt > Date.now()) return albumCache.albums;
+    const albums = new Map<string, Album>();
+    for (const query of ['new music', 'chill', 'indie', 'electronic']) {
+      try {
+        for (const album of await client.searchAlbums({ query, limit: 25, offset: 0 })) albums.set(album.id, album);
+      } catch { /* Keep successful release results if another SoundCloud query fails. */ }
+      if (albums.size >= 25) break;
+    }
+    const sortedAlbums = [...albums.values()].sort((a, b) => (b.year ?? 0) - (a.year ?? 0));
+    albumCache = { albums: sortedAlbums, expiresAt: Date.now() + (albums.size ? 10 : 0.25) * 60_000 };
+    return albumCache.albums;
+  }
+
+  let vibeCache: { key: string; expiresAt: number; tracks: Track[] } | null = null;
+  async function myVibePool(): Promise<Track[]> {
+    const [recentIds, likedIds] = await Promise.all([history.ids(userEmail, 10), favorites.ids(userEmail)]);
+    const seeds = [...new Set([...recentIds, ...likedIds])].slice(0, 5);
+    if (seeds.length === 0) return recommendationPool();
+    const key = seeds.join(',');
+    if (vibeCache?.key === key && vibeCache.expiresAt > Date.now()) return vibeCache.tracks;
+    const relatedLists = await Promise.all(seeds.slice(0, 3).map((id) => client.getRelatedTracks(String(id), 30).catch(() => [])));
+    const tracks = new Map<string, Track>();
+    const seedSet = new Set(seeds.map(String));
+    for (const related of relatedLists) {
+      for (const track of related) if (!seedSet.has(track.id)) tracks.set(track.id, track);
+    }
+    if (tracks.size < 30) {
+      for (const track of await recommendationPool()) if (!seedSet.has(track.id) && !tracks.has(track.id)) tracks.set(track.id, track);
+    }
+    vibeCache = { key, tracks: [...tracks.values()], expiresAt: Date.now() + 3 * 60_000 };
+    return vibeCache.tracks;
+  }
+
+  const requireSession = (request: FastifyRequest, reply: FastifyReply, queryToken?: string) =>
+    !requireAuth || authenticate(request, reply, tokenService, queryToken) !== null;
+
+  // The connection probe is intentionally public, as required by Tape. Sample rows are populated from SoundCloud.
+  app.get(`${tapeApiPrefix}/public/stats`, async () => {
+    const [tracks, albums] = await Promise.all([recommendationPool(), albumPool()]);
+    const sampleAlbums = albums.slice(0, 12).map(toTapeAlbumSummary).filter((album): album is TapeAlbumSummary => album !== null);
+    return {
+      tracks_count: tracks.length,
+      sample_covers: sampleAlbums.map((album) => album.id),
+      sample_albums: sampleAlbums,
+    };
+  });
+
+  app.post<{ Body: LoginBody }>(`${tapeApiPrefix}/auth/login`, async (request, reply) => {
+    if (!tokenService) return reply.code(503).send({ error: 'Set TAPE_USER_PASSWORD and a 32+ character TAPE_JWT_SECRET to enable Tape sign-in.' });
+    const email = typeof request.body?.email === 'string' ? request.body.email.trim().toLowerCase() : '';
+    const password = typeof request.body?.password === 'string' ? request.body.password : '';
+    if (email !== userEmail.toLowerCase() || !constantTimeStringEqual(password, userPassword)) {
+      return reply.code(401).send({ error: 'Invalid email or password.' });
+    }
+    return tokenService.issuePair(userEmail);
+  });
+
+  app.post<{ Body: RefreshBody }>(`${tapeApiPrefix}/auth/refresh`, async (request, reply) => {
+    if (!tokenService) return reply.code(503).send({ error: 'Tape sign-in is not configured.' });
+    const refreshToken = request.body?.refresh_token;
+    if (typeof refreshToken !== 'string') return reply.code(400).send({ error: 'refresh_token is required.' });
+    const claims = tokenService.verify(refreshToken, 'refresh');
+    if (!claims || revokedRefreshTokens.has(claims.jti)) return reply.code(401).send({ error: 'Invalid or expired refresh token.' });
+    revokedRefreshTokens.add(claims.jti);
+    return tokenService.issuePair(userEmail);
+  });
+
+  app.post<{ Body: RefreshBody }>(`${tapeApiPrefix}/auth/logout`, async (request, reply) => {
+    if (!tokenService) return reply.code(204).send();
+    const refreshToken = request.body?.refresh_token;
+    if (typeof refreshToken === 'string') {
+      const claims = tokenService.verify(refreshToken, 'refresh');
+      if (claims) revokedRefreshTokens.add(claims.jti);
+    }
+    return reply.code(204).send();
+  });
+
+  app.get(`${tapeApiPrefix}/auth/me`, async (request, reply) => {
+    const claims = authenticate(request, reply, tokenService);
+    if (!claims) return;
+    try {
+      return {
+        id: 1,
+        email: userEmail,
+        tg_username: null,
+        tg_first_name: null,
+        role: 'user',
+        has_access: true,
+        avatar_url: null,
+        emoji_url: null,
+        logs_requested: false,
+        liked_track_ids: await favorites.ids(userEmail),
+      };
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  });
+
+  app.get<{ Querystring: SearchQuery }>(`${tapeApiPrefix}/library/search`, async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    const query = typeof request.query.q === 'string' ? request.query.q.trim() : '';
+    if (!query || query.length > 300) return reply.code(400).send({ error: 'q must contain 1 to 300 characters.' });
+    let limit: number;
+    let offset: number;
+    try {
+      limit = parseInteger(request.query.limit, 25, 1, 50);
+      offset = parseInteger(request.query.offset, 0, 0, 10_000);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Invalid pagination.' });
+    }
+    try {
+      const [tracks, artists, albums] = await Promise.all([
+        client.searchTracks({ query, limit, offset }),
+        client.searchArtists({ query, limit, offset }),
+        client.searchAlbums({ query, limit, offset }),
+      ]);
+      return {
+        artists: artists.map(toTapeArtistSummary).filter((artist): artist is TapeArtistSummary => artist !== null),
+        albums: albums.map(toTapeAlbumSummary).filter((album): album is TapeAlbumSummary => album !== null),
+        tracks: tracks.map(toTapeTopTrack).filter((track): track is TapeTopTrack => track !== null),
+        layout_fixed: true,
+        query,
+      };
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  });
+
+  app.get<{ Querystring: { limit?: string; exclude_ids?: string } }>(`${tapeApiPrefix}/library/tracks/random`, async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    let limit: number;
+    try { limit = parseInteger(request.query.limit, 10, 1, 50); }
+    catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Invalid limit.' }); }
+    const excluded = new Set((request.query.exclude_ids ?? '').split(',').map((id) => Number(id)).filter(Number.isSafeInteger));
+    try {
+      const found = await myVibePool();
+      const pool = found.map(toTapeQueueTrack).filter((track): track is TapeQueueTrack => track !== null && !excluded.has(track.id));
+      for (let i = pool.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+      }
+      return pool.slice(0, limit);
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  });
+
+  app.get<{ Params: TrackParams; Querystring: StreamQuery }>(`${tapeApiPrefix}/library/tracks/:id/stream`, async (request, reply) => {
+    if (!requireSession(request, reply, request.query.token)) return;
+    if (tapeId(request.params.id) === null) return reply.code(400).send({ error: 'Invalid SoundCloud track ID.' });
+    try {
+      const mediaUrl = await client.getStreamUrl(request.params.id);
+      if (!isTrustedMediaUrl(mediaUrl)) return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
+      const headers = new Headers();
+      if (request.headers.range) headers.set('Range', request.headers.range);
+      const upstream = await mediaFetch(mediaUrl, { headers, redirect: 'follow' });
+      reply.header('Cache-Control', 'no-store, no-cache, must-revalidate');
+      reply.header('Pragma', 'no-cache');
+      reply.header('X-Content-Type-Options', 'nosniff');
+      const contentType = upstream.headers.get('content-type') ?? '';
+      if (upstream.ok && /mpegurl|vnd\.apple\.mpegurl/i.test(contentType)) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return reply.code(307).header('Location', isTrustedMediaUrl(upstream.url) ? upstream.url : mediaUrl).send();
+      }
+      if (!upstream.ok && upstream.status !== 206) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return reply.code(upstream.status === 416 ? 416 : 502).send({ error: 'SoundCloud could not provide this audio stream.' });
+      }
+      reply.code(upstream.status);
+      for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+        const value = upstream.headers.get(header);
+        if (value) reply.header(header, value);
+      }
+      if (!upstream.body) return reply.send();
+      return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  });
+
+  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/cover/:id`, async (request, reply) => {
+    if (tapeId(request.params.id) === null) return reply.code(404).send();
+    try {
+      const album = await client.getAlbumById(request.params.id);
+      const result = await sendArtwork(album.artworkUrl, reply);
+      if (result !== null) return result;
+      return sendCover(request, reply);
+    } catch (error) {
+      if (error instanceof SoundCloudApiError && error.statusCode === 404) return sendCover(request, reply);
+      return sendApiError(reply, error);
+    }
+  });
+  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/track-cover/:id`, sendCover);
+  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/artist-cover/:id`, sendArtistCover);
+
+  async function sendCover(request: { params: CoverParams }, reply: FastifyReply) {
+    if (tapeId(request.params.id) === null) return reply.code(404).send();
+    try {
+      const track = await client.getTrackById(request.params.id);
+      return await sendArtwork(track.artworkUrl, reply);
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  }
+
+  async function sendArtistCover(request: { params: CoverParams }, reply: FastifyReply) {
+    if (tapeId(request.params.id) === null) return reply.code(404).send();
+    try {
+      const artist = await client.getArtistById(request.params.id);
+      return await sendArtwork(artist.artworkUrl, reply);
+    } catch (error) { return sendApiError(reply, error); }
+  }
+
+  async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply) {
+    if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return reply.code(404).send();
+    const upstream = await mediaFetch(artworkUrl, { redirect: 'follow' });
+    const contentType = upstream.headers.get('content-type') ?? '';
+    if (!upstream.ok || !contentType.startsWith('image/')) {
+      await upstream.body?.cancel().catch(() => undefined);
+      return reply.code(404).send();
+    }
+    reply.header('Cache-Control', 'no-store');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.type(contentType);
+    const length = upstream.headers.get('content-length');
+    if (length) reply.header('Content-Length', length);
+    if (!upstream.body) return reply.code(404).send();
+    return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
+  }
+
+  app.get(`${tapeApiPrefix}/library/artists`, async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    try {
+      const artists = await client.searchArtists({ query: 'music', limit: 50, offset: 0 });
+      return artists.map(toTapeArtistSummary).filter((artist): artist is TapeArtistSummary => artist !== null);
+    } catch (error) { return sendApiError(reply, error); }
+  });
+
+  app.get<{ Params: TrackParams }>(`${tapeApiPrefix}/library/artists/:id`, async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    if (tapeId(request.params.id) === null) return reply.code(404).send();
+    try {
+      const artist = await client.getArtistById(request.params.id);
+      const id = tapeId(artist.id);
+      if (id === null) return reply.code(404).send();
+      return {
+        id,
+        name: artist.name,
+        bio: artist.biography ?? null,
+        cover_rev: 1,
+        is_subscribed: false,
+        subscribers_count: artist.followersCount,
+        monthly_listeners: artist.monthlyListeners,
+        albums: artist.albums.map(toTapeArtistAlbum).filter((album): album is TapeArtistAlbum => album !== null),
+      };
+    } catch (error) { return sendApiError(reply, error); }
+  });
+
+  app.get<{ Params: TrackParams }>(`${tapeApiPrefix}/library/artists/:id/top-tracks`, async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    if (tapeId(request.params.id) === null) return reply.code(404).send();
+    try {
+      const tracks = await client.getArtistTracks(request.params.id, 50);
+      return tracks.sort((a, b) => (b.playbackCount ?? 0) - (a.playbackCount ?? 0)).slice(0, 20)
+        .map(toTapeTopTrack).filter((track): track is TapeTopTrack => track !== null);
+    } catch (error) { return sendApiError(reply, error); }
+  });
+
+  app.get<{ Params: TrackParams }>(`${tapeApiPrefix}/library/albums/:id`, async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    if (tapeId(request.params.id) === null) return reply.code(404).send();
+    try {
+      let album: Album;
+      try {
+        album = await client.getAlbumById(request.params.id);
+      } catch (error) {
+        if (!(error instanceof SoundCloudApiError) || error.statusCode !== 404) throw error;
+        const track = await client.getTrackById(request.params.id);
+        album = {
+          id: track.albumId ?? track.id,
+          title: track.albumTitle || track.title,
+          artistId: track.artistId ?? track.id,
+          artist: track.artist,
+          trackCount: 1,
+          releaseType: 'single',
+          tracks: [track],
+        };
+      }
+      const id = tapeId(album.id);
+      const artistId = tapeId(album.artistId);
+      if (id === null || artistId === null) return reply.code(404).send();
+      return {
+        id,
+        title: album.title,
+        ...(album.year ? { year: album.year } : {}),
+        artist_id: artistId,
+        artists_display: album.artist,
+        tracks: album.tracks.map((track, index) => {
+          const trackId = tapeId(track.id);
+          return trackId === null ? null : { id: trackId, title: track.title, duration_seconds: toSeconds(track.durationMs), track_number: index + 1, artists_display: track.artist };
+        }).filter((track): track is NonNullable<typeof track> => track !== null),
+      };
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  });
+
+  app.get(`${tapeApiPrefix}/library/liked`, async (request, reply) => {
+    if (!authenticate(request, reply, tokenService)) return;
+    try {
+      return await favorites.list(userEmail);
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  });
+
+  app.post<{ Params: TrackIdParams }>(`${tapeApiPrefix}/library/liked/:track_id`, async (request, reply) => {
+    if (!authenticate(request, reply, tokenService)) return;
+    if (tapeId(request.params.track_id) === null) return reply.code(400).send({ error: 'Invalid SoundCloud track ID.' });
+    try {
+      const track = await client.getTrackById(request.params.track_id);
+      const favorite = toTapeLikedTrack(track);
+      if (!favorite) return reply.code(400).send({ error: 'This SoundCloud track cannot be represented by Tape.' });
+      await favorites.toggle(userEmail, favorite);
+      return reply.code(204).send();
+    } catch (error) {
+      return sendApiError(reply, error);
+    }
+  });
+
+  app.post<{ Body: PlayBody }>(`${tapeApiPrefix}/library/plays`, async (request, reply) => {
+    if (!authenticate(request, reply, tokenService)) return;
+    const trackId = tapeId(String(request.body?.track_id ?? ''));
+    if (trackId === null) return reply.code(400).send({ error: 'track_id must be a SoundCloud track ID.' });
+    try {
+      const track = toTapeTopTrack(await client.getTrackById(String(trackId)));
+      if (!track) return reply.code(400).send({ error: 'This SoundCloud track cannot be represented by Tape.' });
+      await history.record(userEmail, track);
+      vibeCache = null;
+      return reply.code(204).send();
+    } catch (error) { return sendApiError(reply, error); }
+  });
+
+  app.get(`${tapeApiPrefix}/library/me/stats`, async (request, reply) => {
+    if (!authenticate(request, reply, tokenService)) return;
+    try { return { ...await history.stats(userEmail), liked_count: (await favorites.list(userEmail)).length }; }
+    catch (error) { return sendApiError(reply, error); }
+  });
+  app.get(`${tapeApiPrefix}/library/me/top-tracks`, async (request, reply) => {
+    if (!authenticate(request, reply, tokenService)) return;
+    try {
+      const tracks = await myVibePool();
+      return [...tracks].sort((a, b) => (b.playbackCount ?? 0) - (a.playbackCount ?? 0)).slice(0, 20)
+        .map(toTapeTopTrack).filter((track): track is TapeTopTrack => track !== null);
+    } catch (error) { return sendApiError(reply, error); }
+  });
+  app.get(`${tapeApiPrefix}/library/me/recent`, async (request, reply) => {
+    if (!authenticate(request, reply, tokenService)) return;
+    return history.recent(userEmail, 30);
+  });
+
+  app.get('/health', async () => ({ ok: true, service: 'tape-soundcloud-adapter' }));
+
+  if (options.listen !== false) await app.listen({ host, port });
+  return app;
+}
+
+interface TapeArtistSummary { id: number; name: string; }
+interface TapeAlbumSummary { id: number; title: string; artist: string; year?: number; }
+interface TapeArtistAlbum { id: number; title: string; year?: number; track_count: number; release_type: 'album' | 'ep' | 'single'; }
+
+interface TapeTopTrack {
+  id: number;
+  title: string;
+  album_id: number;
+  album_title: string;
+  play_count: number;
+  duration_seconds: number;
+  artists_display: string;
+  cover_album_id: number;
+  bpm?: number;
+}
+
+interface TapeQueueTrack {
+  id: number;
+  title: string;
+  artist: string;
+  artists_display: string;
+  album: string;
+  duration_seconds: number;
+  cover_album_id: number;
+  bpm?: number;
+}
+
+function toTapeArtistSummary(artist: Artist): TapeArtistSummary | null {
+  const id = tapeId(artist.id);
+  return id === null ? null : { id, name: artist.name };
+}
+
+function toTapeAlbumSummary(album: Album): TapeAlbumSummary | null {
+  const id = tapeId(album.id);
+  if (id === null) return null;
+  return { id, title: album.title, artist: album.artist, ...(album.year ? { year: album.year } : {}) };
+}
+
+function toTapeArtistAlbum(album: Album): TapeArtistAlbum | null {
+  const id = tapeId(album.id);
+  if (id === null) return null;
+  return {
+    id,
+    title: album.title,
+    ...(album.year ? { year: album.year } : {}),
+    track_count: album.trackCount,
+    release_type: album.releaseType,
+  };
+}
+
+function toTapeTopTrack(track: Track): TapeTopTrack | null {
+  const id = tapeId(track.id);
+  if (id === null) return null;
+  const albumId = tapeId(track.albumId ?? '') ?? id;
+  return {
+    id,
+    title: track.title,
+    album_id: albumId,
+    album_title: track.albumTitle || 'Singles',
+    play_count: track.playbackCount ?? 0,
+    duration_seconds: toSeconds(track.durationMs),
+    artists_display: track.artist,
+    cover_album_id: albumId,
+    bpm: track.bpm,
+  };
+}
+
+function toTapeQueueTrack(track: Track): TapeQueueTrack | null {
+  const id = tapeId(track.id);
+  if (id === null || !track.artist.trim()) return null;
+  const albumId = tapeId(track.albumId ?? '') ?? id;
+  return {
+    id,
+    title: track.title,
+    artist: track.artist,
+    artists_display: track.artist,
+    album: track.albumTitle || 'Singles',
+    duration_seconds: toSeconds(track.durationMs),
+    cover_album_id: albumId,
+    bpm: track.bpm,
+  };
+}
+
+function toTapeLikedTrack(track: Track): TapeLikedTrack | null {
+  const id = tapeId(track.id);
+  if (id === null || !track.artist.trim()) return null;
+  return { id, title: track.title, artist: track.artist, album: track.albumTitle || 'Singles', duration_seconds: toSeconds(track.durationMs) };
+}
+
+function tapeId(value: string): number | null {
+  if (!/^\d{1,16}$/.test(value)) return null;
+  const result = Number(value);
+  return Number.isSafeInteger(result) ? result : null;
+}
+
+function toSeconds(durationMs: number): number {
+  return Math.max(0, Math.round(durationMs / 1000));
+}
+
+function parseInteger(value: string | number | undefined, fallback: number, min: number, max: number): number {
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) throw new Error(`Expected integer between ${min} and ${max}.`);
+  return parsed;
+}
+
+function authenticate(request: FastifyRequest, reply: FastifyReply, tokenService: TapeTokenService | null, queryToken?: string): TapeSessionClaims | null {
+  if (!tokenService) {
+    void reply.code(503).send({ error: 'Tape sign-in is not configured.' });
+    return null;
+  }
+  const header = request.headers.authorization ?? '';
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  const token = match?.[1] ?? queryToken;
+  const claims = token ? tokenService.verify(token, 'access') : null;
+  if (!claims) {
+    void reply.code(401).send(authFailure);
+    return null;
+  }
+  return claims;
+}
+
+function constantTimeStringEqual(actual: string, expected: string): boolean {
+  const actualHash = createHash('sha256').update(actual).digest();
+  const expectedHash = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(actualHash, expectedHash);
+}
+
+function isTrustedMediaUrl(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && !url.username && !url.password && (host === 'sndcdn.com' || host.endsWith('.sndcdn.com') || host === 'soundcloud.com' || host.endsWith('.soundcloud.com') || host === 'soundcloud.cloud' || host.endsWith('.soundcloud.cloud'));
+  } catch { return false; }
+}
+
+function isTrustedArtworkUrl(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && !url.username && !url.password && (host === 'sndcdn.com' || host.endsWith('.sndcdn.com'));
+  } catch { return false; }
+}
+
+function sendApiError(reply: FastifyReply, error: unknown) {
+  if (error instanceof SoundCloudApiError) {
+    const status = error.statusCode === 401 ? 502 : error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 502;
+    return reply.code(status).send({ error: error.message });
+  }
+  const message = error instanceof Error ? error.message : 'Unexpected server error';
+  return reply.code(502).send({ error: message.slice(0, 300) });
+}
