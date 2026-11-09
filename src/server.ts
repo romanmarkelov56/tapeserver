@@ -129,7 +129,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   const requireSession = (request: FastifyRequest, reply: FastifyReply, queryToken?: string) =>
     !requireAuth || authenticate(request, reply, tokenService, queryToken) !== null;
 
-  // The connection probe is intentionally public, as required by Tape. Sample rows are populated from SoundCloud.
+  // Connection probe is public for Tape.
   app.get(`${tapeApiPrefix}/public/stats`, async () => {
     const [tracks, albums] = await Promise.all([recommendationPool(), albumPool()]);
     const sampleAlbums = albums.slice(0, 12).map(toTapeAlbumSummary).filter((album): album is TapeAlbumSummary => album !== null);
@@ -140,8 +140,6 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     };
   });
 
-  // Tape probes GET /auth/login to discover whether password sign-in is offered.
-  // Return 405 (route exists, but requires POST) instead of Fastify's default 404.
   app.get(`${tapeApiPrefix}/auth/login`, async (_request, reply) =>
     reply.header('allow', 'POST').code(405).send({ error: 'Use POST with email and password to sign in.' }));
 
@@ -155,9 +153,6 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     return tokenService.issuePair(userEmail);
   });
 
-  // Tape probes the documented register route to determine whether a server offers identity.
-  // This deployment is intentionally single-owner: registration only accepts the credentials
-  // configured by the server owner and never creates arbitrary public accounts.
   app.post<{ Body: LoginBody }>(`${tapeApiPrefix}/auth/register`, async (request, reply) => {
     if (!tokenService) return reply.code(503).send({ error: 'Set TAPE_USER_PASSWORD and a 32+ character TAPE_JWT_SECRET to enable Tape sign-in.' });
     const email = typeof request.body?.email === 'string' ? request.body.email.trim().toLowerCase() : '';
@@ -268,9 +263,11 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       const headers = new Headers();
       if (request.headers.range) headers.set('Range', request.headers.range);
       const upstream = await mediaFetch(mediaUrl, { headers, redirect: 'follow' });
-      reply.header('Cache-Control', 'no-store, no-cache, must-revalidate');
-      reply.header('Pragma', 'no-cache');
+      
+      // Allow iOS Tape app and AVPlayer to store track data locally on the iPhone for offline listening!
+      reply.header('Cache-Control', 'public, max-age=31536000, immutable');
       reply.header('X-Content-Type-Options', 'nosniff');
+      
       const contentType = upstream.headers.get('content-type') ?? '';
       if (upstream.ok && /mpegurl|vnd\.apple\.mpegurl/i.test(contentType)) {
         await upstream.body?.cancel().catch(() => undefined);
@@ -333,7 +330,8 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       await upstream.body?.cancel().catch(() => undefined);
       return reply.code(404).send();
     }
-    reply.header('Cache-Control', 'no-store');
+    // Allow iOS Tape app to store cover artwork locally on device
+    reply.header('Cache-Control', 'public, max-age=2592000, immutable');
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.type(contentType);
     const length = upstream.headers.get('content-length');

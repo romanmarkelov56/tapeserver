@@ -1,4 +1,5 @@
 import type { Track, SearchParams, Artist, Album } from '../types.js';
+import { SoundCloudClientIdResolver } from './client-id-resolver.js';
 
 type FetchLike = typeof fetch;
 type RawTrack = Record<string, any>;
@@ -14,9 +15,9 @@ export class SoundCloudApiError extends Error {
 export class SoundCloudClient {
   private readonly apiBaseUrl: string;
   private readonly apiV2BaseUrl: string;
-  private readonly clientId: string;
+  private readonly resolver: SoundCloudClientIdResolver;
   private readonly accessToken?: string;
-  private readonly request: FetchLike;
+  private readonly fetchFn: FetchLike;
 
   constructor(
     clientId = '',
@@ -24,11 +25,58 @@ export class SoundCloudClient {
     request: FetchLike = fetch,
     options: { apiBaseUrl?: string; apiV2BaseUrl?: string } = {},
   ) {
-    this.clientId = clientId || clientIdFromToken(accessToken);
+    const initialClientId = clientId || clientIdFromToken(accessToken);
+    this.resolver = new SoundCloudClientIdResolver(initialClientId);
     this.accessToken = accessToken;
-    this.request = request;
+    this.fetchFn = request;
     this.apiBaseUrl = options.apiBaseUrl ?? 'https://api.soundcloud.com';
     this.apiV2BaseUrl = options.apiV2BaseUrl ?? 'https://api-v2.soundcloud.com';
+  }
+
+  public async getClientId(forceRefresh = false): Promise<string> {
+    return this.resolver.getClientId(forceRefresh);
+  }
+
+  public async refreshClientId(): Promise<string> {
+    return this.resolver.refreshClientId();
+  }
+
+  private async request(url: URL | string, init?: RequestInit, isRetry = false): Promise<Response> {
+    const targetUrl = typeof url === 'string' ? new URL(url) : new URL(url.toString());
+
+    // Inject client_id into query params for soundcloud.com endpoints
+    if (targetUrl.hostname.includes('soundcloud.com') && !targetUrl.searchParams.has('client_id')) {
+      const activeClientId = await this.resolver.getClientId();
+      if (activeClientId) {
+        targetUrl.searchParams.set('client_id', activeClientId);
+      }
+    }
+
+    const headers = new Headers(init?.headers);
+    if (this.accessToken && !headers.has('Authorization')) {
+      headers.set('Authorization', `OAuth ${this.accessToken}`);
+    }
+
+    const response = await this.fetchFn(targetUrl.toString(), {
+      ...init,
+      headers,
+    });
+
+    if (response.status === 401 && !isRetry) {
+      await this.resolver.refreshClientId();
+      // Retry once with refreshed client_id
+      const retryUrl = new URL(targetUrl.toString());
+      const newClientId = await this.resolver.getClientId();
+      if (newClientId) {
+        retryUrl.searchParams.set('client_id', newClientId);
+      }
+      return this.fetchFn(retryUrl.toString(), {
+        ...init,
+        headers,
+      });
+    }
+
+    return response;
   }
 
   async searchTracks(params: SearchParams): Promise<Track[]> {
@@ -36,7 +84,7 @@ export class SoundCloudClient {
     if (!query) throw new Error('Search query must not be empty');
     const limit = clampInteger(params.limit, 20, 1, 50);
     const offset = clampInteger(params.offset, 0, 0, 10_000);
-    const url = this.withClientId(new URL('/search/tracks', this.apiV2BaseUrl));
+    const url = new URL('/search/tracks', this.apiV2BaseUrl);
     url.searchParams.set('q', query);
     url.searchParams.set('limit', String(limit));
     url.searchParams.set('offset', String(offset));
@@ -49,7 +97,7 @@ export class SoundCloudClient {
       throw new SoundCloudApiError('Unable to reach SoundCloud API', 502);
     }
     if (!response.ok && [400, 404, 410, 422].includes(response.status)) {
-      const legacy = this.withClientId(new URL('/tracks', this.apiBaseUrl));
+      const legacy = new URL('/tracks', this.apiBaseUrl);
       legacy.searchParams.set('q', query);
       legacy.searchParams.set('limit', String(limit));
       legacy.searchParams.set('offset', String(offset));
@@ -121,11 +169,11 @@ export class SoundCloudClient {
 
   async getTrackById(trackId: string): Promise<Track> {
     const id = validateTrackId(trackId);
-    let response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiV2BaseUrl)), {
+    let response = await this.request(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiV2BaseUrl), {
       headers: this.headers(),
     });
     if (!response.ok && [400, 404, 410, 422].includes(response.status)) {
-      response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiBaseUrl)), {
+      response = await this.request(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiBaseUrl), {
         headers: this.headers(),
       });
     }
@@ -138,14 +186,14 @@ export class SoundCloudClient {
   /** Resolve one playable transcoding. Do not expose its signed URL to clients. */
   async getStreamUrl(trackId: string): Promise<string> {
     const id = validateTrackId(trackId);
-    let response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiV2BaseUrl)), {
+    let response = await this.request(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiV2BaseUrl), {
       headers: this.headers(),
     });
     let rawTrack: RawTrack;
     if (response.ok) {
       rawTrack = await response.json() as RawTrack;
     } else if ([400, 404, 410, 422].includes(response.status)) {
-      response = await this.request(this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiBaseUrl)), {
+      response = await this.request(new URL(`/tracks/${encodeURIComponent(id)}`, this.apiBaseUrl), {
         headers: this.headers(),
       });
       if (!response.ok) throw await this.toApiError(response);
@@ -165,7 +213,7 @@ export class SoundCloudClient {
 
     for (const candidate of candidates) {
       try {
-        const resolveUrl = this.withClientId(new URL(candidate.url));
+        const resolveUrl = new URL(candidate.url);
         const resolved = await this.request(resolveUrl, { headers: this.headers(), redirect: 'manual' });
         if (resolved.status >= 300 && resolved.status < 400) {
           const location = resolved.headers.get('location');
@@ -181,7 +229,7 @@ export class SoundCloudClient {
     }
 
     // Documented API compatibility path: this endpoint responds with a redirect.
-    const streamUrl = this.withClientId(new URL(`/tracks/${encodeURIComponent(id)}/stream`, this.apiBaseUrl));
+    const streamUrl = new URL(`/tracks/${encodeURIComponent(id)}/stream`, this.apiBaseUrl);
     const streamResponse = await this.request(streamUrl, { headers: this.headers(), redirect: 'manual' });
     if (streamResponse.status >= 300 && streamResponse.status < 400) {
       const location = streamResponse.headers.get('location');
@@ -199,11 +247,6 @@ export class SoundCloudClient {
     return headers;
   }
 
-  private withClientId(url: URL): URL {
-    if (this.clientId) url.searchParams.set('client_id', this.clientId);
-    return url;
-  }
-
   private async searchEntities(kind: 'users' | 'playlists', params: SearchParams): Promise<RawTrack[]> {
     const query = params.query.trim();
     if (!query) throw new Error('Search query must not be empty');
@@ -219,11 +262,11 @@ export class SoundCloudClient {
   }
 
   private async getJson(path: string, params: Record<string, string> = {}, fallbackPath = path): Promise<RawTrack> {
-    const url = this.withClientId(new URL(path, this.apiV2BaseUrl));
+    const url = new URL(path, this.apiV2BaseUrl);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     let response = await this.request(url, { headers: this.headers() });
     if (!response.ok && [400, 404, 410, 422].includes(response.status)) {
-      const fallback = this.withClientId(new URL(fallbackPath, this.apiBaseUrl));
+      const fallback = new URL(fallbackPath, this.apiBaseUrl);
       for (const [key, value] of Object.entries(params)) fallback.searchParams.set(key, value);
       fallback.searchParams.set('linked_partitioning', 'true');
       response = await this.request(fallback, { headers: this.headers() });
@@ -282,7 +325,6 @@ export class SoundCloudClient {
       id: String(item.id),
       title: String(item.title).trim() || 'Unknown Track',
       artist: String(artist).trim() || 'Unknown Artist',
-      // SoundCloud API track.duration is already expressed in milliseconds.
       durationMs: Number.isFinite(Number(item.duration)) ? Math.max(0, Number(item.duration)) : 0,
       permalinkUrl: typeof item.permalink_url === 'string' ? item.permalink_url : '',
       artworkUrl: typeof artwork === 'string' ? artwork.replace(/^http:/, 'https:') : undefined,

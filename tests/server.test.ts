@@ -197,7 +197,7 @@ describe('Tape-compatible SoundCloud server', () => {
     assert.equal(response.statusCode, 206);
     assert.equal(seenRange, 'bytes=0-3');
     assert.equal(response.headers['content-range'], 'bytes 0-3/100');
-    assert.match(response.headers['cache-control'] ?? '', /no-store/);
+    assert.match(response.headers['cache-control'] ?? '', /public/);
     assert.equal(response.body, 'data');
     assert.equal(mock.calls.stream, '123');
   });
