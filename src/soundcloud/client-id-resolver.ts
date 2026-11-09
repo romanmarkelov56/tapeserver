@@ -1,4 +1,3 @@
-import fetch from 'node-fetch';
 
 export class SoundCloudClientIdResolver {
   private clientId: string | null;
