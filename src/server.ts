@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
 import ffmpegPath from 'ffmpeg-static';
 import { config as defaultConfig } from './config.js';
 import { SoundCloudApiError, SoundCloudClient } from './soundcloud/client.js';
