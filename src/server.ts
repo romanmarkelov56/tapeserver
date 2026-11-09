@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { Readable } from 'node:stream';
+import { spawn } from 'node:child_process';
+import ffmpegPath from 'ffmpeg-static';
 import { config as defaultConfig } from './config.js';
 import { SoundCloudApiError, SoundCloudClient } from './soundcloud/client.js';
 import { JsonFavoritesStore, type FavoritesStore, type TapeLikedTrack } from './favorites-store.js';
@@ -22,7 +23,6 @@ export interface ServerConfig {
   historyStore?: PlayHistoryStore;
   host?: string;
   port?: number;
-  /** Set false when using Fastify.inject() in tests. */
   listen?: boolean;
   soundCloudClient?: TapeSoundCloudClient;
   mediaFetch?: typeof fetch;
@@ -56,18 +56,20 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     options.soundCloudAccessToken ?? defaultConfig.soundCloudAccessToken,
   );
   const mediaFetch = options.mediaFetch ?? fetch;
+
   if (requireAuth && !userPassword) throw new Error('Set TAPE_USER_PASSWORD and TAPE_JWT_SECRET before starting; Tape authentication is required by default.');
   if (userPassword && userPassword.length < 8) throw new Error('TAPE_USER_PASSWORD must contain at least 8 characters');
   const tokenService = userPassword ? new TapeTokenService(jwtSecret) : null;
   const revokedRefreshTokens = new Set<string>();
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
+
   app.addHook('onResponse', async (request, reply) => {
     const routeOrPath = request.routeOptions.url ?? request.url.split('?')[0];
     if (routeOrPath.startsWith(`${tapeApiPrefix}/auth/`)) {
-      // Do not log request bodies, headers, credentials, tokens, or query parameters.
       console.info(`[Tape auth diagnostic] ${request.method} ${routeOrPath} -> ${reply.statusCode}`);
     }
   });
+
   let recommendationCache: { expiresAt: number; tracks: Track[] } | null = null;
 
   async function recommendationPool(): Promise<Track[]> {
@@ -81,11 +83,11 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     for (const query of queries.slice(0, 3)) {
       try {
         for (const track of await client.searchTracks({ query, limit: 50, offset: 0 })) tracks.set(track.id, track);
-      } catch { /* Try another discovery term if SoundCloud has a gap or a query is restricted. */ }
+      } catch {}
     }
     if (tracks.size === 0) {
       try { for (const track of await client.searchTracks({ query: 'music', limit: 50, offset: 0 })) tracks.set(track.id, track); }
-      catch { /* Return an empty fallback only when SoundCloud is unreachable. */ }
+      catch {}
     }
     recommendationCache = { tracks: [...tracks.values()], expiresAt: Date.now() + (tracks.size ? 3 : 0.25) * 60_000 };
     return recommendationCache.tracks;
@@ -98,7 +100,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     for (const query of ['new music', 'chill', 'indie', 'electronic']) {
       try {
         for (const album of await client.searchAlbums({ query, limit: 25, offset: 0 })) albums.set(album.id, album);
-      } catch { /* Keep successful release results if another SoundCloud query fails. */ }
+      } catch {}
       if (albums.size >= 25) break;
     }
     const sortedAlbums = [...albums.values()].sort((a, b) => (b.year ?? 0) - (a.year ?? 0));
@@ -129,7 +131,6 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   const requireSession = (request: FastifyRequest, reply: FastifyReply, queryToken?: string) =>
     !requireAuth || authenticate(request, reply, tokenService, queryToken) !== null;
 
-  // Connection probe is public for Tape.
   app.get(`${tapeApiPrefix}/public/stats`, async () => {
     const [tracks, albums] = await Promise.all([recommendationPool(), albumPool()]);
     const sampleAlbums = albums.slice(0, 12).map(toTapeAlbumSummary).filter((album): album is TapeAlbumSummary => album !== null);
@@ -254,36 +255,40 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     }
   });
 
+  // Streaming endpoint converted with FFmpeg on-the-fly to MP3 stream
   app.get<{ Params: TrackParams; Querystring: StreamQuery }>(`${tapeApiPrefix}/library/tracks/:id/stream`, async (request, reply) => {
     if (!requireSession(request, reply, request.query.token)) return;
     if (tapeId(request.params.id) === null) return reply.code(400).send({ error: 'Invalid SoundCloud track ID.' });
     try {
       const mediaUrl = await client.getStreamUrl(request.params.id);
       if (!isTrustedMediaUrl(mediaUrl)) return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
-      const headers = new Headers();
-      if (request.headers.range) headers.set('Range', request.headers.range);
-      const upstream = await mediaFetch(mediaUrl, { headers, redirect: 'follow' });
-      
-      // Allow iOS Tape app and AVPlayer to store track data locally on the iPhone for offline listening!
+
+      reply.header('Content-Type', 'audio/mpeg');
+      reply.header('Accept-Ranges', 'bytes');
       reply.header('Cache-Control', 'public, max-age=31536000, immutable');
       reply.header('X-Content-Type-Options', 'nosniff');
-      
-      const contentType = upstream.headers.get('content-type') ?? '';
-      if (upstream.ok && /mpegurl|vnd\.apple\.mpegurl/i.test(contentType)) {
-        await upstream.body?.cancel().catch(() => undefined);
-        return reply.code(307).header('Location', isTrustedMediaUrl(upstream.url) ? upstream.url : mediaUrl).send();
-      }
-      if (!upstream.ok && upstream.status !== 206) {
-        await upstream.body?.cancel().catch(() => undefined);
-        return reply.code(upstream.status === 416 ? 416 : 502).send({ error: 'SoundCloud could not provide this audio stream.' });
-      }
-      reply.code(upstream.status);
-      for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
-        const value = upstream.headers.get(header);
-        if (value) reply.header(header, value);
-      }
-      if (!upstream.body) return reply.send();
-      return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
+
+      const executablePath = typeof ffmpegPath === 'string' && ffmpegPath ? ffmpegPath : 'ffmpeg';
+
+      const ffmpeg = spawn(executablePath, [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', mediaUrl,
+        '-vn',
+        '-acodec', 'libmp3lame',
+        '-ab', '192k',
+        '-f', 'mp3',
+        'pipe:1'
+      ]);
+
+      ffmpeg.stderr.on('data', () => {});
+
+      request.raw.on('close', () => {
+        ffmpeg.kill('SIGKILL');
+      });
+
+      return reply.send(ffmpeg.stdout);
     } catch (error) {
       return sendApiError(reply, error);
     }
@@ -330,7 +335,6 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       await upstream.body?.cancel().catch(() => undefined);
       return reply.code(404).send();
     }
-    // Allow iOS Tape app to store cover artwork locally on device
     reply.header('Cache-Control', 'public, max-age=2592000, immutable');
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.type(contentType);
@@ -458,6 +462,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     try { return { ...await history.stats(userEmail), liked_count: (await favorites.list(userEmail)).length }; }
     catch (error) { return sendApiError(reply, error); }
   });
+
   app.get(`${tapeApiPrefix}/library/me/top-tracks`, async (request, reply) => {
     if (!authenticate(request, reply, tokenService)) return;
     try {
@@ -466,6 +471,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
         .map(toTapeTopTrack).filter((track): track is TapeTopTrack => track !== null);
     } catch (error) { return sendApiError(reply, error); }
   });
+
   app.get(`${tapeApiPrefix}/library/me/recent`, async (request, reply) => {
     if (!authenticate(request, reply, tokenService)) return;
     return history.recent(userEmail, 30);
