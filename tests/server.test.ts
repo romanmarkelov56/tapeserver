@@ -6,6 +6,7 @@ import { afterEach, describe, it } from 'node:test';
 import { JsonFavoritesStore } from '../src/favorites-store.js';
 import type { Track, Artist, Album } from '../src/types.js';
 import { createMusicStreamerServer } from '../src/server.js';
+import { SoundCloudApiError } from '../src/soundcloud/client.js';
 
 const track: Track = {
   id: '123', title: 'Demo', artist: 'Artist', durationMs: 10_500,
