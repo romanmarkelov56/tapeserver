@@ -5,7 +5,7 @@ type FetchLike = typeof fetch;
 type RawTrack = Record<string, any>;
 
 export class SoundCloudApiError extends Error {
-  constructor(message: string, readonly statusCode: number) {
+  constructor(message: string, readonly statusCode: number, readonly retryAfterSeconds?: number) {
     super(message);
     this.name = 'SoundCloudApiError';
   }
@@ -418,7 +418,9 @@ export class SoundCloudClient {
       404: 'SoundCloud resource was not found',
       429: 'SoundCloud rate limit reached; retry later',
     };
-    return new SoundCloudApiError(message[response.status] ?? `SoundCloud API request failed (${response.status})`, response.status);
+    const retryHeader = response.headers.get('retry-after');
+    const retrySeconds = retryHeader && /^\d+$/.test(retryHeader) ? Math.min(3600, Math.max(1, Number(retryHeader))) : undefined;
+    return new SoundCloudApiError(message[response.status] ?? `SoundCloud API request failed (${response.status})`, response.status, retrySeconds);
   }
 }
 
