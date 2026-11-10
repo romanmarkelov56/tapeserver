@@ -6,6 +6,7 @@ import { afterEach, describe, it } from 'node:test';
 import { JsonFavoritesStore } from '../src/favorites-store.js';
 import type { Track, Artist, Album } from '../src/types.js';
 import { createMusicStreamerServer } from '../src/server.js';
+import { SoundCloudApiError } from '../src/soundcloud/client.js';
 
 const track: Track = {
   id: '123', title: 'Demo', artist: 'Artist', durationMs: 10_500,
@@ -27,7 +28,7 @@ const artist: Artist = {
 const temporaryDirectories: string[] = [];
 
 function testClient() {
-  const calls: { search?: { query: string; limit?: number; offset?: number }; track?: string; stream?: string; related?: string[] } = {};
+  const calls: { search?: { query: string; limit?: number; offset?: number }; track?: string; stream?: string; streamCalls?: number; related?: string[] } = {};
   return {
     calls,
     client: {
@@ -38,8 +39,9 @@ function testClient() {
       getArtistTracks: async () => [track],
       getRelatedTracks: async (id: string) => { calls.related = [...(calls.related ?? []), id]; return [relatedTrack]; },
       getAlbumById: async () => album,
+      getAlbumArtworkById: async () => album,
       getTrackById: async (id: string) => { calls.track = id; return track; },
-      getStreamUrl: async (id: string) => { calls.stream = id; return 'https://cf-media.sndcdn.com/demo.mp3?signature=private'; },
+      getStreamUrl: async (id: string) => { calls.stream = id; calls.streamCalls = (calls.streamCalls ?? 0) + 1; return 'https://cf-media.sndcdn.com/demo.mp3?signature=private'; },
     },
   };
 }
@@ -80,9 +82,9 @@ describe('Tape-compatible SoundCloud server', () => {
     const response = await app.inject({ method: 'GET', url: '/api/v1/public/stats' });
     assert.equal(response.statusCode, 200);
     assert.deepEqual(response.json(), {
-      tracks_count: 1,
-      sample_covers: [456],
-      sample_albums: [{ id: 456, title: 'Demo EP', artist: 'Artist', year: 2024 }],
+      tracks_count: 0,
+      sample_covers: [],
+      sample_albums: [],
     });
   });
 
@@ -100,6 +102,47 @@ describe('Tape-compatible SoundCloud server', () => {
       layout_fixed: true, query: 'demo',
     });
     assert.deepEqual(mock.calls.search, { query: 'demo', limit: 8, offset: 0 });
+  });
+
+  it('falls back to the original artwork URL when the 500px CDN variant is unavailable', async () => {
+    const mock = testClient();
+    mock.client.getTrackById = async () => ({ ...track, artworkUrl: 'https://i1.sndcdn.com/cover-large.jpg' });
+    const requested: string[] = [];
+    const mediaFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes('-t500x500')) return new Response('blocked', { status: 403 });
+      return new Response(Buffer.from('image'), { headers: { 'content-type': 'image/jpeg' } });
+    };
+    app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, mediaFetch, ...tapeAuth });
+    const response = await app.inject({ method: 'GET', url: '/api/v1/library/track-cover/123' });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['content-type'], 'image/jpeg');
+    assert.deepEqual(requested, [
+      'https://i1.sndcdn.com/cover-t500x500.jpg',
+      'https://i1.sndcdn.com/cover-large.jpg',
+    ]);
+  });
+
+  it('falls back to a track cover when a playlist artwork URL is unavailable', async () => {
+    const mock = testClient();
+    mock.client.getAlbumArtworkById = async () => ({ ...album, artworkUrl: 'https://i1.sndcdn.com/blocked-album.jpg' });
+    mock.client.getTrackById = async () => ({ ...track, artworkUrl: 'https://i1.sndcdn.com/working-track.jpg' });
+    const requested: string[] = [];
+    const mediaFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes('blocked-album')) return new Response('blocked', { status: 403 });
+      return new Response(Buffer.from('image'), { headers: { 'content-type': 'image/jpeg' } });
+    };
+    app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, mediaFetch, ...tapeAuth });
+    const response = await app.inject({ method: 'GET', url: '/api/v1/library/cover/456' });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['content-type'], 'image/jpeg');
+    assert.deepEqual(requested, [
+      'https://i1.sndcdn.com/blocked-album.jpg',
+      'https://i1.sndcdn.com/working-track.jpg',
+    ]);
   });
 
   it('serves SoundCloud artist pages, discography, top tracks, and album tracklists', async () => {
@@ -124,6 +167,24 @@ describe('Tape-compatible SoundCloud server', () => {
     assert.equal(release.statusCode, 200);
     assert.deepEqual(release.json(), {
       id: 456, title: 'Demo EP', year: 2024, artist_id: 77, artists_display: 'Artist',
+      tracks: [{ id: 123, title: 'Demo', duration_seconds: 11, track_number: 1, artists_display: 'Artist' }],
+    });
+  });
+
+  it('builds an album page from its track when SoundCloud denies playlist access', async () => {
+    const mock = testClient();
+    mock.client.getAlbumById = async () => { throw new SoundCloudApiError('SoundCloud denied access to this resource', 403); };
+    mock.client.getTrackById = async () => ({ ...track, artistId: '77', albumId: '456', albumTitle: 'Demo EP' });
+    app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, ...tapeAuth });
+    const accessToken = await login(app);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/library/albums/456',
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), {
+      id: 456, title: 'Demo EP', artist_id: 77, artists_display: 'Artist',
       tracks: [{ id: 123, title: 'Demo', duration_seconds: 11, track_number: 1, artists_display: 'Artist' }],
     });
   });
@@ -200,6 +261,24 @@ describe('Tape-compatible SoundCloud server', () => {
     assert.match(response.headers['cache-control'] ?? '', /public/);
     assert.equal(response.body, 'data');
     assert.equal(mock.calls.stream, '123');
+  });
+
+  it('reuses a resolved SoundCloud stream URL for repeated requests to the same track', async () => {
+    const mock = testClient();
+    const mediaFetch: typeof fetch = async () => new Response(Buffer.from('audio'), {
+      status: 200,
+      headers: { 'content-type': 'audio/mpeg', 'content-length': '5' },
+    });
+    app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, mediaFetch, ...tapeAuth });
+    const accessToken = await login(app);
+    const url = `/api/v1/library/tracks/123/stream?token=${accessToken}`;
+
+    const first = await app.inject({ method: 'GET', url });
+    const second = await app.inject({ method: 'GET', url });
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 200);
+    assert.equal(mock.calls.streamCalls, 1);
   });
 
   it('provides a nonempty personalized recommendation pool and validates search inputs after login', async () => {

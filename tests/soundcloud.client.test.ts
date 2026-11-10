@@ -44,6 +44,7 @@ describe('SoundCloudClient', () => {
       if (url.pathname === '/users/77/tracks') return Response.json({ collection: [rawTrack] });
       if (url.pathname === '/tracks/123/related') return Response.json({ collection: [rawTrack] });
       if (url.pathname === '/playlists/456') return Response.json({ ...playlist, tracks: [rawTrack] });
+      if (url.pathname === '/playlists/456/tracks') return Response.json({ collection: [rawTrack] });
       throw new Error(`Unexpected request ${url.pathname}`);
     };
     const client = new SoundCloudClient('client-id', 'secret-token', request, apiOptions);
@@ -64,6 +65,35 @@ describe('SoundCloudClient', () => {
     assert.equal(album.artistId, '77');
     assert.deepEqual(album.tracks.map((track) => track.title), ['Demo']);
     assert.deepEqual(paths.slice(0, 2), ['/search/users', '/search/playlists']);
+  });
+
+  it('loads all album tracks from the dedicated paginated playlist endpoint', async () => {
+    const requested: URL[] = [];
+    const user = { id: 77, username: 'Tape Artist' };
+    const playlist = { id: 456, title: 'Full Album', user, user_id: 77, track_count: 7, is_album: true };
+    const tracks = Array.from({ length: 7 }, (_, index) => ({
+      id: 100 + index, title: `Track ${index + 1}`, duration: 60_000,
+      user, permalink_url: `https://soundcloud.com/artist/track-${index + 1}`,
+    }));
+    const request: typeof fetch = async (input) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      if (url.pathname === '/playlists/456') return Response.json(playlist);
+      if (url.pathname === '/playlists/456/tracks' && !url.searchParams.has('cursor')) {
+        return Response.json({ collection: tracks.slice(0, 5), next_href: 'https://api-v2.soundcloud.test/playlists/456/tracks?cursor=next&limit=200' });
+      }
+      if (url.pathname === '/playlists/456/tracks' && url.searchParams.get('cursor') === 'next') {
+        return Response.json({ collection: tracks.slice(5) });
+      }
+      throw new Error(`Unexpected request ${url.pathname}`);
+    };
+    const client = new SoundCloudClient('client-id', 'secret-token', request, apiOptions);
+    const album = await client.getAlbumById('456');
+    assert.equal(album.trackCount, 7);
+    assert.deepEqual(album.tracks.map((track) => track.title), tracks.map((track) => track.title));
+    assert.equal(requested.filter((url) => url.pathname === '/playlists/456/tracks').length, 2);
+    assert.equal(requested[1].searchParams.get('limit'), '200');
+    assert.equal(requested[1].searchParams.get('linked_partitioning'), 'true');
   });
 
   it('resolves a SoundCloud HLS transcoding', async () => {
@@ -115,8 +145,10 @@ describe('SoundCloudClient', () => {
       return Response.json({ collection: [] });
     };
     const payload = Buffer.from(JSON.stringify({ client_id: 'embedded-client-id' })).toString('base64url');
-    const client = new SoundCloudClient('', `header.${payload}.signature`, request, apiOptions);
+    const client = new SoundCloudClient('', `header.${payload}.signature`, request);
     await client.searchTracks({ query: 'jazz' });
-    assert.equal(new URL(requestedUrl).searchParams.get('client_id'), 'embedded-client-id');
+    const parsedUrl = new URL(requestedUrl);
+    assert.equal(parsedUrl.hostname, 'api-v2.soundcloud.com');
+    assert.equal(parsedUrl.searchParams.get('client_id'), 'embedded-client-id');
   });
 });

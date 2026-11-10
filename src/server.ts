@@ -1,8 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
-import ffmpegPath from 'ffmpeg-static';
 import { config as defaultConfig } from './config.js';
 import { SoundCloudApiError, SoundCloudClient } from './soundcloud/client.js';
 import { JsonFavoritesStore, type FavoritesStore, type TapeLikedTrack } from './favorites-store.js';
@@ -11,7 +9,7 @@ import type { Track, Artist, Album } from './types.js';
 import { TapeTokenService, type TapeSessionClaims } from './tape-auth.js';
 
 type TapeSoundCloudClient = Pick<SoundCloudClient,
-  'searchTracks' | 'searchArtists' | 'searchAlbums' | 'getArtistById' | 'getArtistTracks' | 'getRelatedTracks' | 'getAlbumById' | 'getTrackById' | 'getStreamUrl'>;
+  'searchTracks' | 'searchArtists' | 'searchAlbums' | 'getArtistById' | 'getArtistTracks' | 'getRelatedTracks' | 'getAlbumById' | 'getAlbumArtworkById' | 'getTrackById' | 'getStreamUrl'>;
 
 export interface ServerConfig {
   soundCloudClientId?: string;
@@ -64,12 +62,124 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   const revokedRefreshTokens = new Set<string>();
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
 
-  app.addHook('onResponse', async (request, reply) => {
+  app.addHook('onRequest', async (request) => {
     const routeOrPath = request.routeOptions.url ?? request.url.split('?')[0];
-    if (routeOrPath.startsWith(`${tapeApiPrefix}/auth/`)) {
-      console.info(`[Tape auth diagnostic] ${request.method} ${routeOrPath} -> ${reply.statusCode}`);
+    if (routeOrPath.startsWith(`${tapeApiPrefix}/`)) {
+      console.info(`[Tape request] ${request.method} ${routeOrPath}`);
     }
   });
+
+  app.addHook('onResponse', async (request, reply) => {
+    const routeOrPath = request.routeOptions.url ?? request.url.split('?')[0];
+    if (routeOrPath.startsWith(`${tapeApiPrefix}/`)) {
+      console.info(`[Tape response] ${request.method} ${routeOrPath} -> ${reply.statusCode}`);
+    }
+  });
+
+  // Cache short-lived signed media URLs to avoid resolving the same track on every AVPlayer request.
+  const streamUrlCache = new Map<string, { url: string; expiresAt: number }>();
+  const streamUrlInflight = new Map<string, Promise<string>>();
+  let soundCloudRateLimitedUntil = 0;
+  const streamUrlCacheTtlMs = 2 * 60_000;
+
+  async function resolveStreamUrl(trackId: string): Promise<string> {
+    const cached = streamUrlCache.get(trackId);
+    if (cached && cached.expiresAt > Date.now()) return cached.url;
+    if (cached) streamUrlCache.delete(trackId);
+
+    const pending = streamUrlInflight.get(trackId);
+    if (pending) return pending;
+
+    if (soundCloudRateLimitedUntil > Date.now()) {
+      const error = new SoundCloudApiError('SoundCloud rate limit cooldown is active; retry later', 429);
+      throw error;
+    }
+
+    const resolving = client.getStreamUrl(trackId).then((url) => {
+      streamUrlCache.set(trackId, { url, expiresAt: Date.now() + streamUrlCacheTtlMs });
+      // Keep the in-memory cache bounded on long-running instances.
+      if (streamUrlCache.size > 500) {
+        const oldestKey = streamUrlCache.keys().next().value;
+        if (oldestKey !== undefined) streamUrlCache.delete(oldestKey);
+      }
+      return url;
+    }).catch((error: unknown) => {
+      if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+        soundCloudRateLimitedUntil = Date.now() + 30_000;
+      }
+      throw error;
+    }).finally(() => {
+      streamUrlInflight.delete(trackId);
+    });
+
+    streamUrlInflight.set(trackId, resolving);
+    return resolving;
+  }
+
+  // Album detail cache and singleflight prevent duplicate playlist requests.
+  const albumDetailCache = new Map<string, { expiresAt: number; album: Album }>();
+  const albumDetailInflight = new Map<string, Promise<Album>>();
+  let albumRateLimitedUntil = 0;
+  let albumRetryAfterSeconds = 60;
+  const albumDetailCacheTtlMs = 15 * 60_000;
+  // Tape can request several album pages at once. Serialize upstream album
+  // lookups so opening a grid does not burst SoundCloud with parallel requests.
+  let albumLoadQueue: Promise<void> = Promise.resolve();
+
+  async function loadAlbumDetail(albumId: string): Promise<Album> {
+    const cached = albumDetailCache.get(albumId);
+    if (cached && cached.expiresAt > Date.now()) return cached.album;
+    if (cached) albumDetailCache.delete(albumId);
+    const pending = albumDetailInflight.get(albumId);
+    if (pending) return pending;
+    const loading = albumLoadQueue.then(async () => {
+      // Check the shared cooldown when this job reaches the front of the queue,
+      // not when Tape initially enqueues a batch of album requests.
+      if (albumRateLimitedUntil > Date.now()) {
+        throw new SoundCloudApiError('SoundCloud is temporarily rate-limiting album requests; retry later', 429, Math.max(1, Math.ceil((albumRateLimitedUntil - Date.now()) / 1000)));
+      }
+      try {
+        let album: Album;
+        try {
+          album = await client.getAlbumById(albumId);
+        } catch (error) {
+          if (!(error instanceof SoundCloudApiError) || ![403, 404, 410].includes(error.statusCode)) throw error;
+          const track = await client.getTrackById(albumId);
+          album = { id: track.albumId ?? track.id, title: track.albumTitle || track.title, artistId: track.artistId ?? track.id, artist: track.artist, trackCount: 1, releaseType: 'single', tracks: [track] };
+        }
+        albumDetailCache.set(albumId, { album, expiresAt: Date.now() + albumDetailCacheTtlMs });
+        if (albumDetailCache.size > 100) {
+          const oldestKey = albumDetailCache.keys().next().value;
+          if (oldestKey !== undefined) albumDetailCache.delete(oldestKey);
+        }
+        return album;
+      } catch (error) {
+        if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+          albumRetryAfterSeconds = error.retryAfterSeconds ?? 60;
+          albumRateLimitedUntil = Date.now() + albumRetryAfterSeconds * 1000;
+          console.warn(`[Tape albums] SoundCloud rate limit hit for album ${albumId}; cooldown ${albumRetryAfterSeconds}s`);
+        } else if (error instanceof SoundCloudApiError) {
+          console.warn(`[Tape albums] SoundCloud returned ${error.statusCode} for album ${albumId}: ${error.message}`);
+        }
+        throw error;
+      } finally { albumDetailInflight.delete(albumId); }
+    });
+    // Keep the queue alive after a failed request and leave a short gap between
+    // albums to avoid immediate bursts against SoundCloud's API.
+    albumLoadQueue = loading.then(
+      () => new Promise<void>((resolve) => setTimeout(resolve, 500)),
+      () => new Promise<void>((resolve) => setTimeout(resolve, 500)),
+    );
+    albumDetailInflight.set(albumId, loading);
+    return loading;
+  }
+
+  // Temporary in-process artwork cache. Render disks are ephemeral; memory cache
+  // avoids repeated SoundCloud API/CDN requests while this instance stays warm.
+  const artworkCache = new Map<string, { expiresAt: number; contentType: string; body: Buffer }>();
+  const artworkInflight = new Map<string, Promise<{ contentType: string; body: Buffer } | null>>();
+  const artworkCacheTtlMs = 6 * 60 * 60 * 1000;
+  const artworkCacheMaxEntries = 300;
 
   let recommendationCache: { expiresAt: number; tracks: Track[] } | null = null;
 
@@ -97,15 +207,22 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   let albumCache: { expiresAt: number; albums: Album[] } | null = null;
   async function albumPool(): Promise<Album[]> {
     if (albumCache && albumCache.expiresAt > Date.now()) return albumCache.albums;
+
+    // Use playlists published by SoundCloud's own editorial profile only.
+    // Public API search is free with the public client_id; it is not personalized.
+    const officialOwners = new Set(['soundcloud', 'soundcloud go', 'soundcloud charts']);
     const albums = new Map<string, Album>();
-    for (const query of ['new music', 'chill', 'indie', 'electronic']) {
-      try {
-        for (const album of await client.searchAlbums({ query, limit: 25, offset: 0 })) albums.set(album.id, album);
-      } catch {}
-      if (albums.size >= 25) break;
+    try {
+      const results = await client.searchAlbums({ query: 'SoundCloud', limit: 50, offset: 0 });
+      for (const album of results) {
+        if (officialOwners.has(album.artist.trim().toLowerCase())) albums.set(album.id, album);
+      }
+    } catch (error) {
+      console.warn('[Tape home] Unable to load SoundCloud editorial playlists:', error instanceof Error ? error.message : 'unknown error');
     }
+
     const sortedAlbums = [...albums.values()].sort((a, b) => (b.year ?? 0) - (a.year ?? 0));
-    albumCache = { albums: sortedAlbums, expiresAt: Date.now() + (albums.size ? 10 : 0.25) * 60_000 };
+    albumCache = { albums: sortedAlbums, expiresAt: Date.now() + (albums.size ? 30 : 2) * 60_000 };
     return albumCache.albums;
   }
 
@@ -133,10 +250,10 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     !requireAuth || authenticate(request, reply, tokenService, queryToken) !== null;
 
   app.get(`${tapeApiPrefix}/public/stats`, async () => {
-    const [tracks, albums] = await Promise.all([recommendationPool(), albumPool()]);
+    const albums = await albumPool();
     const sampleAlbums = albums.slice(0, 12).map(toTapeAlbumSummary).filter((album): album is TapeAlbumSummary => album !== null);
     return {
-      tracks_count: tracks.length,
+      tracks_count: 0,
       sample_covers: sampleAlbums.map((album) => album.id),
       sample_albums: sampleAlbums,
     };
@@ -256,41 +373,87 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     }
   });
 
-  // Streaming endpoint converted with FFmpeg on-the-fly to MP3 stream
+  // Proxy the original SoundCloud media file so AVPlayer can download byte ranges.
   app.get<{ Params: TrackParams; Querystring: StreamQuery }>(`${tapeApiPrefix}/library/tracks/:id/stream`, async (request, reply) => {
     if (!requireSession(request, reply, request.query.token)) return;
     if (tapeId(request.params.id) === null) return reply.code(400).send({ error: 'Invalid SoundCloud track ID.' });
     try {
-      const mediaUrl = await client.getStreamUrl(request.params.id);
-      if (!isTrustedMediaUrl(mediaUrl)) return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
+      console.info(`[Tape stream] Resolving SoundCloud audio for track ${request.params.id}`);
+      const mediaUrl = await resolveStreamUrl(request.params.id);
+      if (!isTrustedMediaUrl(mediaUrl)) {
+        console.error(`[Tape stream] Rejected untrusted media URL for track ${request.params.id}`);
+        return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
+      }
+      console.info(`[Tape stream] Resolved media host ${new URL(mediaUrl).hostname} for track ${request.params.id}`);
 
-      reply.header('Content-Type', 'audio/mpeg');
-      reply.header('Accept-Ranges', 'bytes');
+      const headers = new Headers();
+      const range = request.headers.range;
+      if (typeof range === 'string' && /^bytes=\d*-\d*$/.test(range)) {
+        headers.set('Range', range);
+      }
+
+      const controller = new AbortController();
+      reply.raw.on('close', () => {
+        if (!reply.raw.writableEnded) controller.abort();
+      });
+      const upstream = await mediaFetch(mediaUrl, {
+        method: request.method,
+        headers,
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+
+      // Fetch follows redirects; validate the final destination as well as the signed URL.
+      if (upstream.url && !isTrustedMediaUrl(upstream.url)) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return reply.code(502).send({ error: 'SoundCloud redirected to an untrusted media URL.' });
+      }
+
+      const contentType = upstream.headers.get('content-type') ?? '';
+      console.info(`[Tape stream] Upstream status ${upstream.status}, content-type ${contentType || 'unknown'}, track ${request.params.id}`);
+      if (/mpegurl|vnd\.apple\.mpegurl/i.test(contentType)) {
+        // HLS playlists contain relative segment/key URLs. Redirect the player to
+        // SoundCloud's signed playlist URL so AVPlayer resolves those URLs against
+        // the original CDN origin instead of this API route.
+        const playlistUrl = upstream.url || mediaUrl;
+        if (!isTrustedMediaUrl(playlistUrl)) {
+          await upstream.body?.cancel().catch(() => undefined);
+          console.error(`[Tape stream] Rejected untrusted HLS playlist URL for track ${request.params.id}`);
+          return reply.code(502).send({ error: 'SoundCloud returned an untrusted HLS playlist URL.' });
+        }
+        await upstream.body?.cancel().catch(() => undefined);
+        console.info(`[Tape stream] Redirecting HLS playback to trusted SoundCloud CDN for track ${request.params.id}`);
+        return reply.code(302).header('Cache-Control', 'no-store').header('Location', playlistUrl).send();
+      }
+
+      for (const name of ['accept-ranges', 'content-range', 'content-length', 'etag', 'last-modified']) {
+        const value = upstream.headers.get(name);
+        if (value) reply.header(name, value);
+      }
+      reply.header('Content-Type', contentType || 'audio/mpeg');
       reply.header('Cache-Control', 'public, max-age=31536000, immutable');
       reply.header('X-Content-Type-Options', 'nosniff');
 
-      const executablePath = typeof ffmpegPath === 'string' && ffmpegPath ? ffmpegPath : 'ffmpeg';
+      if (upstream.status === 206 && !upstream.headers.has('content-range')) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return reply.code(502).send({ error: 'SoundCloud returned an invalid partial-content response.' });
+      }
+      if (!upstream.ok) {
+        await upstream.body?.cancel().catch(() => undefined);
+        if (upstream.status === 416) return reply.code(416).send();
+        return reply.code(upstream.status >= 400 ? upstream.status : 502).send({ error: 'Unable to retrieve SoundCloud audio.' });
+      }
 
-      const ffmpeg = spawn(executablePath, [
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        '-i', mediaUrl,
-        '-vn',
-        '-acodec', 'libmp3lame',
-        '-ab', '192k',
-        '-f', 'mp3',
-        'pipe:1'
-      ]);
-
-      ffmpeg.stderr.on('data', () => {});
-
-      request.raw.on('close', () => {
-        ffmpeg.kill('SIGKILL');
-      });
-
-      return reply.send(ffmpeg.stdout);
+      reply.code(upstream.status);
+      if (request.method === 'HEAD' || !upstream.body) return reply.send();
+      return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') return;
+      console.error(`[Tape stream] Failed for track ${request.params.id}:`, error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown error');
+      if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+        const retrySeconds = Math.max(1, Math.ceil((soundCloudRateLimitedUntil - Date.now()) / 1000));
+        reply.header('Retry-After', String(retrySeconds));
+      }
       return sendApiError(reply, error);
     }
   });
@@ -298,51 +461,96 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/cover/:id`, async (request, reply) => {
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
-      const album = await client.getAlbumById(request.params.id);
-      const result = await sendArtwork(album.artworkUrl, reply);
-      if (result !== null) return result;
-      return sendCover(request, reply);
-    } catch (error) {
-      if (error instanceof SoundCloudApiError && error.statusCode === 404) return sendCover(request, reply);
-      return sendApiError(reply, error);
-    }
+      // Fetch artwork metadata only; do not load the entire playlist just to draw a cover.
+      try {
+        const album = await client.getAlbumArtworkById(request.params.id);
+        if (await sendArtwork(album.artworkUrl, reply)) return reply;
+      } catch (error) {
+        if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+          reply.header('Retry-After', String(error.retryAfterSeconds ?? 60));
+          return sendApiError(reply, error);
+        }
+        console.warn(`[Tape artwork] Album cover lookup failed for ${request.params.id}: ${error instanceof Error ? error.message : 'unknown error'}`);
+      }
+      if (await sendCover(request, reply)) return reply;
+      return reply.code(404).send();
+    } catch (error) { return sendApiError(reply, error); }
   });
-  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/track-cover/:id`, sendCover);
-  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/artist-cover/:id`, sendArtistCover);
-
-  async function sendCover(request: { params: CoverParams }, reply: FastifyReply) {
+  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/track-cover/:id`, async (request, reply) => {
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
-      const track = await client.getTrackById(request.params.id);
-      return await sendArtwork(track.artworkUrl, reply);
-    } catch (error) {
-      return sendApiError(reply, error);
-    }
+      if (await sendCover(request, reply)) return reply;
+      return reply.code(404).send();
+    } catch (error) { return sendApiError(reply, error); }
+  });
+  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/artist-cover/:id`, sendArtistCover);
+
+  async function sendCover(request: { params: CoverParams }, reply: FastifyReply): Promise<boolean> {
+    const track = await client.getTrackById(request.params.id);
+    return sendArtwork(track.artworkUrl, reply);
   }
 
   async function sendArtistCover(request: { params: CoverParams }, reply: FastifyReply) {
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
       const artist = await client.getArtistById(request.params.id);
-      return await sendArtwork(artist.artworkUrl, reply);
+      if (await sendArtwork(artist.artworkUrl, reply)) return reply;
+      return reply.code(404).send();
     } catch (error) { return sendApiError(reply, error); }
   }
 
-  async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply) {
-    if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return reply.code(404).send();
-    const upstream = await mediaFetch(artworkUrl, { redirect: 'follow' });
-    const contentType = upstream.headers.get('content-type') ?? '';
-    if (!upstream.ok || !contentType.startsWith('image/')) {
-      await upstream.body?.cancel().catch(() => undefined);
-      return reply.code(404).send();
-    }
+  async function downloadArtwork(artworkUrl: string): Promise<{ contentType: string; body: Buffer } | null> {
+    const cached = artworkCache.get(artworkUrl);
+    if (cached && cached.expiresAt > Date.now()) return { contentType: cached.contentType, body: cached.body };
+    if (cached) artworkCache.delete(artworkUrl);
+    const pending = artworkInflight.get(artworkUrl);
+    if (pending) return pending;
+
+    const task = (async () => {
+      const highResolutionUrl = artworkUrl.replace(/-large(?=\.(?:jpg|jpeg|png|webp)(?:\?|$))/i, '-t500x500');
+      for (const candidate of [...new Set([highResolutionUrl, artworkUrl])]) {
+        let upstream: Response;
+        try {
+          upstream = await mediaFetch(candidate, {
+            redirect: 'follow',
+            headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
+          });
+        } catch (error) {
+          console.warn(`[Tape artwork] CDN request failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+          continue;
+        }
+        const contentType = upstream.headers.get('content-type') ?? '';
+        if (!upstream.ok || !contentType.toLowerCase().startsWith('image/') || !upstream.body) {
+          await upstream.body?.cancel().catch(() => undefined);
+          continue;
+        }
+        const body = Buffer.from(await upstream.arrayBuffer());
+        if (body.length > 8 * 1024 * 1024) continue;
+        const value = { contentType, body };
+        artworkCache.set(artworkUrl, { ...value, expiresAt: Date.now() + artworkCacheTtlMs });
+        while (artworkCache.size > artworkCacheMaxEntries) {
+          const oldestKey = artworkCache.keys().next().value;
+          if (oldestKey === undefined) break;
+          artworkCache.delete(oldestKey);
+        }
+        return value;
+      }
+      return null;
+    })().finally(() => artworkInflight.delete(artworkUrl));
+    artworkInflight.set(artworkUrl, task);
+    return task;
+  }
+
+  async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply): Promise<boolean> {
+    if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return false;
+    const artwork = await downloadArtwork(artworkUrl);
+    if (!artwork) return false;
     reply.header('Cache-Control', 'public, max-age=2592000, immutable');
     reply.header('X-Content-Type-Options', 'nosniff');
-    reply.type(contentType);
-    const length = upstream.headers.get('content-length');
-    if (length) reply.header('Content-Length', length);
-    if (!upstream.body) return reply.code(404).send();
-    return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
+    reply.type(artwork.contentType);
+    reply.header('Content-Length', String(artwork.body.length));
+    reply.send(artwork.body);
+    return true;
   }
 
   app.get(`${tapeApiPrefix}/library/artists`, async (request, reply) => {
@@ -387,22 +595,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     if (!requireSession(request, reply)) return;
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
-      let album: Album;
-      try {
-        album = await client.getAlbumById(request.params.id);
-      } catch (error) {
-        if (!(error instanceof SoundCloudApiError) || error.statusCode !== 404) throw error;
-        const track = await client.getTrackById(request.params.id);
-        album = {
-          id: track.albumId ?? track.id,
-          title: track.albumTitle || track.title,
-          artistId: track.artistId ?? track.id,
-          artist: track.artist,
-          trackCount: 1,
-          releaseType: 'single',
-          tracks: [track],
-        };
-      }
+      const album = await loadAlbumDetail(request.params.id);
       const id = tapeId(album.id);
       const artistId = tapeId(album.artistId);
       if (id === null || artistId === null) return reply.code(404).send();
@@ -418,6 +611,9 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
         }).filter((track): track is NonNullable<typeof track> => track !== null),
       };
     } catch (error) {
+      if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+        reply.header('Retry-After', String(error.retryAfterSeconds ?? albumRetryAfterSeconds));
+      }
       return sendApiError(reply, error);
     }
   });
@@ -445,7 +641,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     }
   });
 
-  app.post<{ Body: PlayBody }>(`${tapeApiPrefix}/library/plays`, async (request, reply) => {
+  const recordPlay = async (request: FastifyRequest<{ Body: PlayBody }>, reply: FastifyReply) => {
     if (!authenticate(request, reply, tokenService)) return;
     const trackId = tapeId(String(request.body?.track_id ?? ''));
     if (trackId === null) return reply.code(400).send({ error: 'track_id must be a SoundCloud track ID.' });
@@ -456,7 +652,10 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       vibeCache = null;
       return reply.code(204).send();
     } catch (error) { return sendApiError(reply, error); }
-  });
+  };
+
+  app.post<{ Body: PlayBody }>(`${tapeApiPrefix}/library/plays`, recordPlay);
+  app.post<{ Body: PlayBody }>(`${tapeApiPrefix}/me/playback`, recordPlay);
 
   app.get(`${tapeApiPrefix}/library/me/stats`, async (request, reply) => {
     if (!authenticate(request, reply, tokenService)) return;
