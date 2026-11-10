@@ -116,6 +116,50 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     return resolving;
   }
 
+  // Album detail cache and singleflight prevent duplicate playlist requests.
+  const albumDetailCache = new Map<string, { expiresAt: number; album: Album }>();
+  const albumDetailInflight = new Map<string, Promise<Album>>();
+  let albumRateLimitedUntil = 0;
+  let albumRetryAfterSeconds = 60;
+  const albumDetailCacheTtlMs = 15 * 60_000;
+
+  async function loadAlbumDetail(albumId: string): Promise<Album> {
+    const cached = albumDetailCache.get(albumId);
+    if (cached && cached.expiresAt > Date.now()) return cached.album;
+    if (cached) albumDetailCache.delete(albumId);
+    const pending = albumDetailInflight.get(albumId);
+    if (pending) return pending;
+    if (albumRateLimitedUntil > Date.now()) {
+      throw new SoundCloudApiError('SoundCloud is temporarily rate-limiting album requests; retry later', 429, Math.max(1, Math.ceil((albumRateLimitedUntil - Date.now()) / 1000)));
+    }
+    const loading = (async () => {
+      try {
+        let album: Album;
+        try {
+          album = await client.getAlbumById(albumId);
+        } catch (error) {
+          if (!(error instanceof SoundCloudApiError) || ![403, 404, 410].includes(error.statusCode)) throw error;
+          const track = await client.getTrackById(albumId);
+          album = { id: track.albumId ?? track.id, title: track.albumTitle || track.title, artistId: track.artistId ?? track.id, artist: track.artist, trackCount: 1, releaseType: 'single', tracks: [track] };
+        }
+        albumDetailCache.set(albumId, { album, expiresAt: Date.now() + albumDetailCacheTtlMs });
+        if (albumDetailCache.size > 100) {
+          const oldestKey = albumDetailCache.keys().next().value;
+          if (oldestKey !== undefined) albumDetailCache.delete(oldestKey);
+        }
+        return album;
+      } catch (error) {
+        if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+          albumRetryAfterSeconds = error.retryAfterSeconds ?? 60;
+          albumRateLimitedUntil = Date.now() + albumRetryAfterSeconds * 1000;
+        }
+        throw error;
+      } finally { albumDetailInflight.delete(albumId); }
+    })();
+    albumDetailInflight.set(albumId, loading);
+    return loading;
+  }
+
   // Temporary in-process artwork cache. Render disks are ephemeral; memory cache
   // avoids repeated SoundCloud API/CDN requests while this instance stays warm.
   const artworkCache = new Map<string, { expiresAt: number; contentType: string; body: Buffer }>();
@@ -533,22 +577,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     if (!requireSession(request, reply)) return;
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
-      let album: Album;
-      try {
-        album = await client.getAlbumById(request.params.id);
-      } catch (error) {
-        if (!(error instanceof SoundCloudApiError) || ![403, 404, 410].includes(error.statusCode)) throw error;
-        const track = await client.getTrackById(request.params.id);
-        album = {
-          id: track.albumId ?? track.id,
-          title: track.albumTitle || track.title,
-          artistId: track.artistId ?? track.id,
-          artist: track.artist,
-          trackCount: 1,
-          releaseType: 'single',
-          tracks: [track],
-        };
-      }
+      const album = await loadAlbumDetail(request.params.id);
       const id = tapeId(album.id);
       const artistId = tapeId(album.artistId);
       if (id === null || artistId === null) return reply.code(404).send();
@@ -564,6 +593,9 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
         }).filter((track): track is NonNullable<typeof track> => track !== null),
       };
     } catch (error) {
+      if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+        reply.header('Retry-After', String(error.retryAfterSeconds ?? albumRetryAfterSeconds));
+      }
       return sendApiError(reply, error);
     }
   });
