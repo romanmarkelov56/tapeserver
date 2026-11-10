@@ -167,19 +167,34 @@ export class SoundCloudClient {
 
   async getAlbumById(albumId: string): Promise<Album> {
     const id = validateTrackId(albumId);
-    const raw = await this.getJson(`/playlists/${encodeURIComponent(id)}`, { show_tracks: 'false' });
+    const raw = await this.getJson(`/playlists/${encodeURIComponent(id)}`, { show_tracks: 'true' });
     const album = this.mapAlbum(raw);
     if (!album) throw new SoundCloudApiError('SoundCloud returned an invalid playlist resource', 502);
 
-    // Playlist detail responses may contain only a small preview of the tracklist.
-    // Load the dedicated tracks collection and follow SoundCloud's next_href cursor.
-    const rawTracks = await this.getAllCollection(`/playlists/${encodeURIComponent(id)}/tracks`, {
-      limit: '200',
-      linked_partitioning: 'true',
-      access: 'playable',
-    });
-    album.tracks = rawTracks.map((item) => this.mapTrack(item)).filter((item): item is Track => item !== null);
-    album.trackCount = Number(raw.track_count) || album.tracks.length;
+    // Use tracks embedded in the playlist response first. SoundCloud may return
+    // only a preview, so fetch the complete collection only when it is incomplete.
+    const embeddedTracks = album.tracks;
+    const expectedTrackCount = Number(raw.track_count) || embeddedTracks.length;
+    album.trackCount = expectedTrackCount;
+
+    if (embeddedTracks.length >= expectedTrackCount || expectedTrackCount === 0) {
+      return album;
+    }
+
+    try {
+      const rawTracks = await this.getAllCollection(`/playlists/${encodeURIComponent(id)}/tracks`, {
+        limit: '200',
+        linked_partitioning: 'true',
+        access: 'playable',
+      });
+      const completeTracks = rawTracks.map((item) => this.mapTrack(item)).filter((item): item is Track => item !== null);
+      if (completeTracks.length > 0) album.tracks = completeTracks;
+    } catch (error) {
+      // Keep the embedded preview usable if SoundCloud throttles or rejects
+      // the secondary full-tracklist request. Do not hide the whole album.
+      if (embeddedTracks.length === 0) throw error;
+    }
+
     return album;
   }
 
