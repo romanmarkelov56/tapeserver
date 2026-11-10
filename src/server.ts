@@ -300,8 +300,18 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       const contentType = upstream.headers.get('content-type') ?? '';
       console.info(`[Tape stream] Upstream status ${upstream.status}, content-type ${contentType || 'unknown'}, track ${request.params.id}`);
       if (/mpegurl|vnd\.apple\.mpegurl/i.test(contentType)) {
+        // HLS playlists contain relative segment/key URLs. Redirect the player to
+        // SoundCloud's signed playlist URL so AVPlayer resolves those URLs against
+        // the original CDN origin instead of this API route.
+        const playlistUrl = upstream.url || mediaUrl;
+        if (!isTrustedMediaUrl(playlistUrl)) {
+          await upstream.body?.cancel().catch(() => undefined);
+          console.error(`[Tape stream] Rejected untrusted HLS playlist URL for track ${request.params.id}`);
+          return reply.code(502).send({ error: 'SoundCloud returned an untrusted HLS playlist URL.' });
+        }
         await upstream.body?.cancel().catch(() => undefined);
-        return reply.code(502).send({ error: 'This track is available only as HLS; byte-range downloads require a progressive audio stream.' });
+        console.info(`[Tape stream] Redirecting HLS playback to trusted SoundCloud CDN for track ${request.params.id}`);
+        return reply.code(302).header('Cache-Control', 'no-store').header('Location', playlistUrl).send();
       }
 
       for (const name of ['accept-ranges', 'content-range', 'content-length', 'etag', 'last-modified']) {
