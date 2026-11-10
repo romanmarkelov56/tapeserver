@@ -9,7 +9,7 @@ import type { Track, Artist, Album } from './types.js';
 import { TapeTokenService, type TapeSessionClaims } from './tape-auth.js';
 
 type TapeSoundCloudClient = Pick<SoundCloudClient,
-  'searchTracks' | 'searchArtists' | 'searchAlbums' | 'getArtistById' | 'getArtistTracks' | 'getRelatedTracks' | 'getAlbumById' | 'getTrackById' | 'getStreamUrl'>;
+  'searchTracks' | 'searchArtists' | 'searchAlbums' | 'getArtistById' | 'getArtistTracks' | 'getRelatedTracks' | 'getAlbumById' | 'getAlbumArtworkById' | 'getTrackById' | 'getStreamUrl'>;
 
 export interface ServerConfig {
   soundCloudClientId?: string;
@@ -115,6 +115,13 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     streamUrlInflight.set(trackId, resolving);
     return resolving;
   }
+
+  // Temporary in-process artwork cache. Render disks are ephemeral; memory cache
+  // avoids repeated SoundCloud API/CDN requests while this instance stays warm.
+  const artworkCache = new Map<string, { expiresAt: number; contentType: string; body: Buffer }>();
+  const artworkInflight = new Map<string, Promise<{ contentType: string; body: Buffer } | null>>();
+  const artworkCacheTtlMs = 6 * 60 * 60 * 1000;
+  const artworkCacheMaxEntries = 300;
 
   let recommendationCache: { expiresAt: number; tracks: Track[] } | null = null;
 
@@ -430,35 +437,58 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     } catch (error) { return sendApiError(reply, error); }
   }
 
+  async function downloadArtwork(artworkUrl: string): Promise<{ contentType: string; body: Buffer } | null> {
+    const cached = artworkCache.get(artworkUrl);
+    if (cached && cached.expiresAt > Date.now()) return { contentType: cached.contentType, body: cached.body };
+    if (cached) artworkCache.delete(artworkUrl);
+    const pending = artworkInflight.get(artworkUrl);
+    if (pending) return pending;
+
+    const task = (async () => {
+      const highResolutionUrl = artworkUrl.replace(/-large(?=\.(?:jpg|jpeg|png|webp)(?:\?|$))/i, '-t500x500');
+      for (const candidate of [...new Set([highResolutionUrl, artworkUrl])]) {
+        let upstream: Response;
+        try {
+          upstream = await mediaFetch(candidate, {
+            redirect: 'follow',
+            headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
+          });
+        } catch (error) {
+          console.warn(`[Tape artwork] CDN request failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+          continue;
+        }
+        const contentType = upstream.headers.get('content-type') ?? '';
+        if (!upstream.ok || !contentType.toLowerCase().startsWith('image/') || !upstream.body) {
+          await upstream.body?.cancel().catch(() => undefined);
+          continue;
+        }
+        const body = Buffer.from(await upstream.arrayBuffer());
+        if (body.length > 8 * 1024 * 1024) continue;
+        const value = { contentType, body };
+        artworkCache.set(artworkUrl, { ...value, expiresAt: Date.now() + artworkCacheTtlMs });
+        while (artworkCache.size > artworkCacheMaxEntries) {
+          const oldestKey = artworkCache.keys().next().value;
+          if (oldestKey === undefined) break;
+          artworkCache.delete(oldestKey);
+        }
+        return value;
+      }
+      return null;
+    })().finally(() => artworkInflight.delete(artworkUrl));
+    artworkInflight.set(artworkUrl, task);
+    return task;
+  }
+
   async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply): Promise<boolean> {
     if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return false;
-    // Try a larger SoundCloud CDN variant first, then the exact URL from the API.
-    const highResolutionUrl = artworkUrl.replace(/-large(?=\.(?:jpg|jpeg|png|webp)(?:\?|$))/i, '-t500x500');
-    for (const candidate of [...new Set([highResolutionUrl, artworkUrl])]) {
-      let upstream: Response;
-      try {
-        upstream = await mediaFetch(candidate, {
-          redirect: 'follow',
-          headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
-        });
-      } catch (error) {
-        console.warn(`[Tape artwork] CDN request failed: ${error instanceof Error ? error.message : 'unknown error'}`);
-        continue;
-      }
-      const contentType = upstream.headers.get('content-type') ?? '';
-      if (!upstream.ok || !contentType.toLowerCase().startsWith('image/') || !upstream.body) {
-        await upstream.body?.cancel().catch(() => undefined);
-        continue;
-      }
-      reply.header('Cache-Control', 'public, max-age=2592000, immutable');
-      reply.header('X-Content-Type-Options', 'nosniff');
-      reply.type(contentType);
-      const length = upstream.headers.get('content-length');
-      if (length) reply.header('Content-Length', length);
-      reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
-      return true;
-    }
-    return false;
+    const artwork = await downloadArtwork(artworkUrl);
+    if (!artwork) return false;
+    reply.header('Cache-Control', 'public, max-age=2592000, immutable');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.type(artwork.contentType);
+    reply.header('Content-Length', String(artwork.body.length));
+    reply.send(artwork.body);
+    return true;
   }
 
   app.get(`${tapeApiPrefix}/library/artists`, async (request, reply) => {
