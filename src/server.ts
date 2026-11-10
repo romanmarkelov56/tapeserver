@@ -76,6 +76,46 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     }
   });
 
+  // Cache short-lived signed media URLs to avoid resolving the same track on every AVPlayer request.
+  const streamUrlCache = new Map<string, { url: string; expiresAt: number }>();
+  const streamUrlInflight = new Map<string, Promise<string>>();
+  let soundCloudRateLimitedUntil = 0;
+  const streamUrlCacheTtlMs = 2 * 60_000;
+
+  async function resolveStreamUrl(trackId: string): Promise<string> {
+    const cached = streamUrlCache.get(trackId);
+    if (cached && cached.expiresAt > Date.now()) return cached.url;
+    if (cached) streamUrlCache.delete(trackId);
+
+    const pending = streamUrlInflight.get(trackId);
+    if (pending) return pending;
+
+    if (soundCloudRateLimitedUntil > Date.now()) {
+      const error = new SoundCloudApiError('SoundCloud rate limit cooldown is active; retry later', 429);
+      throw error;
+    }
+
+    const resolving = client.getStreamUrl(trackId).then((url) => {
+      streamUrlCache.set(trackId, { url, expiresAt: Date.now() + streamUrlCacheTtlMs });
+      // Keep the in-memory cache bounded on long-running instances.
+      if (streamUrlCache.size > 500) {
+        const oldestKey = streamUrlCache.keys().next().value;
+        if (oldestKey !== undefined) streamUrlCache.delete(oldestKey);
+      }
+      return url;
+    }).catch((error: unknown) => {
+      if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+        soundCloudRateLimitedUntil = Date.now() + 30_000;
+      }
+      throw error;
+    }).finally(() => {
+      streamUrlInflight.delete(trackId);
+    });
+
+    streamUrlInflight.set(trackId, resolving);
+    return resolving;
+  }
+
   let recommendationCache: { expiresAt: number; tracks: Track[] } | null = null;
 
   async function recommendationPool(): Promise<Track[]> {
@@ -274,7 +314,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     if (tapeId(request.params.id) === null) return reply.code(400).send({ error: 'Invalid SoundCloud track ID.' });
     try {
       console.info(`[Tape stream] Resolving SoundCloud audio for track ${request.params.id}`);
-      const mediaUrl = await client.getStreamUrl(request.params.id);
+      const mediaUrl = await resolveStreamUrl(request.params.id);
       if (!isTrustedMediaUrl(mediaUrl)) {
         console.error(`[Tape stream] Rejected untrusted media URL for track ${request.params.id}`);
         return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
@@ -345,6 +385,10 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') return;
       console.error(`[Tape stream] Failed for track ${request.params.id}:`, error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown error');
+      if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+        const retrySeconds = Math.max(1, Math.ceil((soundCloudRateLimitedUntil - Date.now()) / 1000));
+        reply.header('Retry-After', String(retrySeconds));
+      }
       return sendApiError(reply, error);
     }
   });
