@@ -122,6 +122,9 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   let albumRateLimitedUntil = 0;
   let albumRetryAfterSeconds = 60;
   const albumDetailCacheTtlMs = 15 * 60_000;
+  // Tape can request several album pages at once. Serialize upstream album
+  // lookups so opening a grid does not burst SoundCloud with parallel requests.
+  let albumLoadQueue: Promise<void> = Promise.resolve();
 
   async function loadAlbumDetail(albumId: string): Promise<Album> {
     const cached = albumDetailCache.get(albumId);
@@ -129,10 +132,12 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     if (cached) albumDetailCache.delete(albumId);
     const pending = albumDetailInflight.get(albumId);
     if (pending) return pending;
-    if (albumRateLimitedUntil > Date.now()) {
-      throw new SoundCloudApiError('SoundCloud is temporarily rate-limiting album requests; retry later', 429, Math.max(1, Math.ceil((albumRateLimitedUntil - Date.now()) / 1000)));
-    }
-    const loading = (async () => {
+    const loading = albumLoadQueue.then(async () => {
+      // Check the shared cooldown when this job reaches the front of the queue,
+      // not when Tape initially enqueues a batch of album requests.
+      if (albumRateLimitedUntil > Date.now()) {
+        throw new SoundCloudApiError('SoundCloud is temporarily rate-limiting album requests; retry later', 429, Math.max(1, Math.ceil((albumRateLimitedUntil - Date.now()) / 1000)));
+      }
       try {
         let album: Album;
         try {
@@ -152,10 +157,19 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
         if (error instanceof SoundCloudApiError && error.statusCode === 429) {
           albumRetryAfterSeconds = error.retryAfterSeconds ?? 60;
           albumRateLimitedUntil = Date.now() + albumRetryAfterSeconds * 1000;
+          console.warn(`[Tape albums] SoundCloud rate limit hit for album ${albumId}; cooldown ${albumRetryAfterSeconds}s`);
+        } else if (error instanceof SoundCloudApiError) {
+          console.warn(`[Tape albums] SoundCloud returned ${error.statusCode} for album ${albumId}: ${error.message}`);
         }
         throw error;
       } finally { albumDetailInflight.delete(albumId); }
-    })();
+    });
+    // Keep the queue alive after a failed request and leave a short gap between
+    // albums to avoid immediate bursts against SoundCloud's API.
+    albumLoadQueue = loading.then(
+      () => new Promise<void>((resolve) => setTimeout(resolve, 500)),
+      () => new Promise<void>((resolve) => setTimeout(resolve, 500)),
+    );
     albumDetailInflight.set(albumId, loading);
     return loading;
   }
