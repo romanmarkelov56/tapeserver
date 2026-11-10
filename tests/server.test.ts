@@ -174,7 +174,7 @@ describe('Tape-compatible SoundCloud server', () => {
   it('builds an album page from its track when SoundCloud denies playlist access', async () => {
     const mock = testClient();
     mock.client.getAlbumById = async () => { throw new SoundCloudApiError('SoundCloud denied access to this resource', 403); };
-    mock.client.getTrackById = async () => ({ ...track, albumId: '456', albumTitle: 'Demo EP' });
+    mock.client.getTrackById = async () => ({ ...track, artistId: '77', albumId: '456', albumTitle: 'Demo EP' });
     app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, ...tapeAuth });
     const accessToken = await login(app);
     const response = await app.inject({
