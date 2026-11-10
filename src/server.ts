@@ -264,7 +264,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
 
       const headers = new Headers();
       const range = request.headers.range;
-      if (typeof range === 'string' && /^bytes=\\d*-\\d*(,\\s*bytes=\\d*-\\d*)*$/.test(range)) {
+      if (typeof range === 'string' && /^bytes=\d*-\d*$/.test(range)) {
         headers.set('Range', range);
       }
 
@@ -286,7 +286,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       }
 
       const contentType = upstream.headers.get('content-type') ?? '';
-      if (/mpegurl|vnd\\.apple\\.mpegurl/i.test(contentType)) {
+      if (/mpegurl|vnd\.apple\.mpegurl/i.test(contentType)) {
         await upstream.body?.cancel().catch(() => undefined);
         return reply.code(502).send({ error: 'This track is available only as HLS; byte-range downloads require a progressive audio stream.' });
       }
