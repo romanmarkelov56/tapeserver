@@ -62,10 +62,17 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   const revokedRefreshTokens = new Set<string>();
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
 
+  app.addHook('onRequest', async (request) => {
+    const routeOrPath = request.routeOptions.url ?? request.url.split('?')[0];
+    if (routeOrPath.startsWith(`${tapeApiPrefix}/`)) {
+      console.info(`[Tape request] ${request.method} ${routeOrPath}`);
+    }
+  });
+
   app.addHook('onResponse', async (request, reply) => {
     const routeOrPath = request.routeOptions.url ?? request.url.split('?')[0];
-    if (routeOrPath.startsWith(`${tapeApiPrefix}/auth/`)) {
-      console.info(`[Tape auth diagnostic] ${request.method} ${routeOrPath} -> ${reply.statusCode}`);
+    if (routeOrPath.startsWith(`${tapeApiPrefix}/`)) {
+      console.info(`[Tape response] ${request.method} ${routeOrPath} -> ${reply.statusCode}`);
     }
   });
 
