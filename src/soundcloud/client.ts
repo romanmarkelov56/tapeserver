@@ -159,10 +159,18 @@ export class SoundCloudClient {
 
   async getAlbumById(albumId: string): Promise<Album> {
     const id = validateTrackId(albumId);
-    const raw = await this.getJson(`/playlists/${encodeURIComponent(id)}`, { show_tracks: 'true' });
+    const raw = await this.getJson(`/playlists/${encodeURIComponent(id)}`, { show_tracks: 'false' });
     const album = this.mapAlbum(raw);
     if (!album) throw new SoundCloudApiError('SoundCloud returned an invalid playlist resource', 502);
-    album.tracks = (Array.isArray(raw.tracks) ? raw.tracks : []).map((item: RawTrack) => this.mapTrack(item)).filter((item: Track | null): item is Track => item !== null);
+
+    // Playlist detail responses may contain only a small preview of the tracklist.
+    // Load the dedicated tracks collection and follow SoundCloud's next_href cursor.
+    const rawTracks = await this.getAllCollection(`/playlists/${encodeURIComponent(id)}/tracks`, {
+      limit: '200',
+      linked_partitioning: 'true',
+      access: 'playable',
+    });
+    album.tracks = rawTracks.map((item) => this.mapTrack(item)).filter((item): item is Track => item !== null);
     album.trackCount = Number(raw.track_count) || album.tracks.length;
     return album;
   }
@@ -253,6 +261,50 @@ export class SoundCloudClient {
     const limit = clampInteger(params.limit, 20, 1, 50);
     const offset = clampInteger(params.offset, 0, 0, 10_000);
     return this.getCollection(`/search/${kind}`, { q: query, limit: String(limit), offset: String(offset) }, `/${kind}`);
+  }
+
+  private async getAllCollection(path: string, params: Record<string, string> = {}): Promise<RawTrack[]> {
+    const firstUrl = new URL(path, this.apiV2BaseUrl);
+    for (const [key, value] of Object.entries(params)) firstUrl.searchParams.set(key, value);
+
+    const items: RawTrack[] = [];
+    const visited = new Set<string>();
+    let nextUrl: URL | null = firstUrl;
+    let pages = 0;
+
+    while (nextUrl && pages < 20 && !visited.has(nextUrl.toString())) {
+      visited.add(nextUrl.toString());
+      pages += 1;
+
+      let response = await this.request(nextUrl, { headers: this.headers() });
+      if (!response.ok && pages === 1 && [400, 404, 410, 422].includes(response.status)) {
+        const fallback = new URL(path, this.apiBaseUrl);
+        for (const [key, value] of Object.entries(params)) fallback.searchParams.set(key, value);
+        fallback.searchParams.set('linked_partitioning', 'true');
+        response = await this.request(fallback, { headers: this.headers() });
+      }
+      if (!response.ok) throw await this.toApiError(response);
+
+      const body = await response.json() as { collection?: RawTrack[]; next_href?: string } | RawTrack[];
+      if (Array.isArray(body)) {
+        items.push(...body);
+        break;
+      }
+      if (Array.isArray(body.collection)) items.push(...body.collection);
+
+      if (typeof body.next_href !== 'string' || !body.next_href) {
+        nextUrl = null;
+      } else {
+        const candidate = new URL(body.next_href, nextUrl);
+        const allowedHosts = new Set([new URL(this.apiV2BaseUrl).hostname, new URL(this.apiBaseUrl).hostname]);
+        if (candidate.protocol !== 'https:' || !allowedHosts.has(candidate.hostname)) {
+          throw new SoundCloudApiError('SoundCloud returned an untrusted pagination URL', 502);
+        }
+        nextUrl = candidate;
+      }
+    }
+
+    return items;
   }
 
   private async getCollection(path: string, params: Record<string, string> = {}, fallbackPath = path): Promise<RawTrack[]> {
