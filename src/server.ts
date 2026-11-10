@@ -396,65 +396,69 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/cover/:id`, async (request, reply) => {
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
-      const album = await client.getAlbumById(request.params.id);
-      const result = await sendArtwork(album.artworkUrl, reply);
-      if (result !== null) return result;
-      return sendCover(request, reply);
-    } catch (error) {
-      if (error instanceof SoundCloudApiError && error.statusCode === 404) return sendCover(request, reply);
-      return sendApiError(reply, error);
-    }
+      // Playlist artwork can be stale or inaccessible; fall back to its first track.
+      try {
+        const album = await client.getAlbumById(request.params.id);
+        if (await sendArtwork(album.artworkUrl, reply)) return reply;
+      } catch (error) {
+        console.warn(`[Tape artwork] Album cover lookup failed for ${request.params.id}: ${error instanceof Error ? error.message : 'unknown error'}`);
+      }
+      if (await sendCover(request, reply)) return reply;
+      return reply.code(404).send();
+    } catch (error) { return sendApiError(reply, error); }
   });
-  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/track-cover/:id`, sendCover);
-  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/artist-cover/:id`, sendArtistCover);
-
-  async function sendCover(request: { params: CoverParams }, reply: FastifyReply) {
+  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/track-cover/:id`, async (request, reply) => {
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
-      const track = await client.getTrackById(request.params.id);
-      return await sendArtwork(track.artworkUrl, reply);
-    } catch (error) {
-      return sendApiError(reply, error);
-    }
+      if (await sendCover(request, reply)) return reply;
+      return reply.code(404).send();
+    } catch (error) { return sendApiError(reply, error); }
+  });
+  app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/artist-cover/:id`, sendArtistCover);
+
+  async function sendCover(request: { params: CoverParams }, reply: FastifyReply): Promise<boolean> {
+    const track = await client.getTrackById(request.params.id);
+    return sendArtwork(track.artworkUrl, reply);
   }
 
   async function sendArtistCover(request: { params: CoverParams }, reply: FastifyReply) {
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
       const artist = await client.getArtistById(request.params.id);
-      return await sendArtwork(artist.artworkUrl, reply);
+      if (await sendArtwork(artist.artworkUrl, reply)) return reply;
+      return reply.code(404).send();
     } catch (error) { return sendApiError(reply, error); }
   }
 
-  async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply) {
-    if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return reply.code(404).send();
-    // Artwork is served by SoundCloud's image CDN, not the audio/API host.
-    // Try the 500px variant first, then fall back to the exact URL supplied by the API.
+  async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply): Promise<boolean> {
+    if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return false;
+    // Try a larger SoundCloud CDN variant first, then the exact URL from the API.
     const highResolutionUrl = artworkUrl.replace(/-large(?=\.(?:jpg|jpeg|png|webp)(?:\?|$))/i, '-t500x500');
-    let upstream = await mediaFetch(highResolutionUrl, {
-      redirect: 'follow',
-      headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
-    });
-    let contentType = upstream.headers.get('content-type') ?? '';
-    if ((!upstream.ok || !contentType.toLowerCase().startsWith('image/')) && highResolutionUrl !== artworkUrl) {
-      await upstream.body?.cancel().catch(() => undefined);
-      upstream = await mediaFetch(artworkUrl, {
-        redirect: 'follow',
-        headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
-      });
-      contentType = upstream.headers.get('content-type') ?? '';
+    for (const candidate of [...new Set([highResolutionUrl, artworkUrl])]) {
+      let upstream: Response;
+      try {
+        upstream = await mediaFetch(candidate, {
+          redirect: 'follow',
+          headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
+        });
+      } catch (error) {
+        console.warn(`[Tape artwork] CDN request failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+        continue;
+      }
+      const contentType = upstream.headers.get('content-type') ?? '';
+      if (!upstream.ok || !contentType.toLowerCase().startsWith('image/') || !upstream.body) {
+        await upstream.body?.cancel().catch(() => undefined);
+        continue;
+      }
+      reply.header('Cache-Control', 'public, max-age=2592000, immutable');
+      reply.header('X-Content-Type-Options', 'nosniff');
+      reply.type(contentType);
+      const length = upstream.headers.get('content-length');
+      if (length) reply.header('Content-Length', length);
+      reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
+      return true;
     }
-    if (!upstream.ok || !contentType.toLowerCase().startsWith('image/')) {
-      await upstream.body?.cancel().catch(() => undefined);
-      return reply.code(404).send();
-    }
-    reply.header('Cache-Control', 'public, max-age=2592000, immutable');
-    reply.header('X-Content-Type-Options', 'nosniff');
-    reply.type(contentType);
-    const length = upstream.headers.get('content-length');
-    if (length) reply.header('Content-Length', length);
-    if (!upstream.body) return reply.code(404).send();
-    return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
+    return false;
   }
 
   app.get(`${tapeApiPrefix}/library/artists`, async (request, reply) => {
