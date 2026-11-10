@@ -1,8 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
-import ffmpegPath from 'ffmpeg-static';
 import { config as defaultConfig } from './config.js';
 import { SoundCloudApiError, SoundCloudClient } from './soundcloud/client.js';
 import { JsonFavoritesStore, type FavoritesStore, type TapeLikedTrack } from './favorites-store.js';
@@ -256,7 +254,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     }
   });
 
-  // Streaming endpoint converted with FFmpeg on-the-fly to MP3 stream
+  // Proxy the original SoundCloud media file so AVPlayer can download byte ranges.
   app.get<{ Params: TrackParams; Querystring: StreamQuery }>(`${tapeApiPrefix}/library/tracks/:id/stream`, async (request, reply) => {
     if (!requireSession(request, reply, request.query.token)) return;
     if (tapeId(request.params.id) === null) return reply.code(400).send({ error: 'Invalid SoundCloud track ID.' });
@@ -264,33 +262,58 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       const mediaUrl = await client.getStreamUrl(request.params.id);
       if (!isTrustedMediaUrl(mediaUrl)) return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
 
-      reply.header('Content-Type', 'audio/mpeg');
-      reply.header('Accept-Ranges', 'bytes');
+      const headers = new Headers();
+      const range = request.headers.range;
+      if (typeof range === 'string' && /^bytes=\\d*-\\d*(,\\s*bytes=\\d*-\\d*)*$/.test(range)) {
+        headers.set('Range', range);
+      }
+
+      const controller = new AbortController();
+      reply.raw.on('close', () => {
+        if (!reply.raw.writableEnded) controller.abort();
+      });
+      const upstream = await mediaFetch(mediaUrl, {
+        method: request.method,
+        headers,
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+
+      // Fetch follows redirects; validate the final destination as well as the signed URL.
+      if (upstream.url && !isTrustedMediaUrl(upstream.url)) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return reply.code(502).send({ error: 'SoundCloud redirected to an untrusted media URL.' });
+      }
+
+      const contentType = upstream.headers.get('content-type') ?? '';
+      if (/mpegurl|vnd\\.apple\\.mpegurl/i.test(contentType)) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return reply.code(502).send({ error: 'This track is available only as HLS; byte-range downloads require a progressive audio stream.' });
+      }
+
+      for (const name of ['accept-ranges', 'content-range', 'content-length', 'etag', 'last-modified']) {
+        const value = upstream.headers.get(name);
+        if (value) reply.header(name, value);
+      }
+      reply.header('Content-Type', contentType || 'audio/mpeg');
       reply.header('Cache-Control', 'public, max-age=31536000, immutable');
       reply.header('X-Content-Type-Options', 'nosniff');
 
-      const executablePath = typeof ffmpegPath === 'string' && ffmpegPath ? ffmpegPath : 'ffmpeg';
+      if (upstream.status === 206 && !upstream.headers.has('content-range')) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return reply.code(502).send({ error: 'SoundCloud returned an invalid partial-content response.' });
+      }
+      if (!upstream.ok) {
+        await upstream.body?.cancel().catch(() => undefined);
+        if (upstream.status === 416) return reply.code(416).send();
+        return reply.code(upstream.status >= 400 ? upstream.status : 502).send({ error: 'Unable to retrieve SoundCloud audio.' });
+      }
 
-      const ffmpeg = spawn(executablePath, [
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        '-i', mediaUrl,
-        '-vn',
-        '-acodec', 'libmp3lame',
-        '-ab', '192k',
-        '-f', 'mp3',
-        'pipe:1'
-      ]);
-
-      ffmpeg.stderr.on('data', () => {});
-
-      request.raw.on('close', () => {
-        ffmpeg.kill('SIGKILL');
-      });
-
-      return reply.send(ffmpeg.stdout);
+      reply.code(upstream.status);
+      if (request.method === 'HEAD' || !upstream.body) return reply.send();
+      return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') return;
       return sendApiError(reply, error);
     }
   });
