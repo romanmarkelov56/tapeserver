@@ -266,8 +266,13 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     if (!requireSession(request, reply, request.query.token)) return;
     if (tapeId(request.params.id) === null) return reply.code(400).send({ error: 'Invalid SoundCloud track ID.' });
     try {
+      console.info(`[Tape stream] Resolving SoundCloud audio for track ${request.params.id}`);
       const mediaUrl = await client.getStreamUrl(request.params.id);
-      if (!isTrustedMediaUrl(mediaUrl)) return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
+      if (!isTrustedMediaUrl(mediaUrl)) {
+        console.error(`[Tape stream] Rejected untrusted media URL for track ${request.params.id}`);
+        return reply.code(502).send({ error: 'SoundCloud returned an untrusted media URL.' });
+      }
+      console.info(`[Tape stream] Resolved media host ${new URL(mediaUrl).hostname} for track ${request.params.id}`);
 
       const headers = new Headers();
       const range = request.headers.range;
@@ -293,6 +298,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       }
 
       const contentType = upstream.headers.get('content-type') ?? '';
+      console.info(`[Tape stream] Upstream status ${upstream.status}, content-type ${contentType || 'unknown'}, track ${request.params.id}`);
       if (/mpegurl|vnd\.apple\.mpegurl/i.test(contentType)) {
         await upstream.body?.cancel().catch(() => undefined);
         return reply.code(502).send({ error: 'This track is available only as HLS; byte-range downloads require a progressive audio stream.' });
@@ -321,6 +327,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       return reply.send(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream));
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') return;
+      console.error(`[Tape stream] Failed for track ${request.params.id}:`, error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown error');
       return sendApiError(reply, error);
     }
   });
@@ -475,7 +482,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     }
   });
 
-  app.post<{ Body: PlayBody }>(`${tapeApiPrefix}/library/plays`, async (request, reply) => {
+  const recordPlay = async (request: FastifyRequest<{ Body: PlayBody }>, reply: FastifyReply) => {
     if (!authenticate(request, reply, tokenService)) return;
     const trackId = tapeId(String(request.body?.track_id ?? ''));
     if (trackId === null) return reply.code(400).send({ error: 'track_id must be a SoundCloud track ID.' });
@@ -486,7 +493,10 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       vibeCache = null;
       return reply.code(204).send();
     } catch (error) { return sendApiError(reply, error); }
-  });
+  };
+
+  app.post<{ Body: PlayBody }>(`${tapeApiPrefix}/library/plays`, recordPlay);
+  app.post<{ Body: PlayBody }>(`${tapeApiPrefix}/me/playback`, recordPlay);
 
   app.get(`${tapeApiPrefix}/library/me/stats`, async (request, reply) => {
     if (!authenticate(request, reply, tokenService)) return;
