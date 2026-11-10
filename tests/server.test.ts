@@ -37,7 +37,7 @@ function testClient() {
       getArtistById: async () => artist,
       getArtistTracks: async () => [track],
       getRelatedTracks: async (id: string) => { calls.related = [...(calls.related ?? []), id]; return [relatedTrack]; },
-      getAlbumById: async () => album,
+      getAlbumById: async () => album,\n      getAlbumArtworkById: async () => album,
       getTrackById: async (id: string) => { calls.track = id; return track; },
       getStreamUrl: async (id: string) => { calls.stream = id; calls.streamCalls = (calls.streamCalls ?? 0) + 1; return 'https://cf-media.sndcdn.com/demo.mp3?signature=private'; },
     },
