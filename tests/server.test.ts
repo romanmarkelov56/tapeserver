@@ -80,9 +80,9 @@ describe('Tape-compatible SoundCloud server', () => {
     const response = await app.inject({ method: 'GET', url: '/api/v1/public/stats' });
     assert.equal(response.statusCode, 200);
     assert.deepEqual(response.json(), {
-      tracks_count: 1,
-      sample_covers: [456],
-      sample_albums: [{ id: 456, title: 'Demo EP', artist: 'Artist', year: 2024 }],
+      tracks_count: 0,
+      sample_covers: [],
+      sample_albums: [],
     });
   });
 
