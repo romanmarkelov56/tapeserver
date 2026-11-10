@@ -295,7 +295,7 @@ export class SoundCloudClient {
       if (typeof body.next_href !== 'string' || !body.next_href) {
         nextUrl = null;
       } else {
-        const candidate = new URL(body.next_href, nextUrl);
+        const candidate: URL = new URL(body.next_href, nextUrl);
         const allowedHosts = new Set([new URL(this.apiV2BaseUrl).hostname, new URL(this.apiBaseUrl).hostname]);
         if (candidate.protocol !== 'https:' || !allowedHosts.has(candidate.hostname)) {
           throw new SoundCloudApiError('SoundCloud returned an untrusted pagination URL', 502);
