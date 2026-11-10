@@ -115,8 +115,10 @@ describe('SoundCloudClient', () => {
       return Response.json({ collection: [] });
     };
     const payload = Buffer.from(JSON.stringify({ client_id: 'embedded-client-id' })).toString('base64url');
-    const client = new SoundCloudClient('', `header.${payload}.signature`, request, apiOptions);
+    const client = new SoundCloudClient('', `header.${payload}.signature`, request);
     await client.searchTracks({ query: 'jazz' });
-    assert.equal(new URL(requestedUrl).searchParams.get('client_id'), 'embedded-client-id');
+    const parsedUrl = new URL(requestedUrl);
+    assert.equal(parsedUrl.hostname, 'api-v2.soundcloud.com');
+    assert.equal(parsedUrl.searchParams.get('client_id'), 'embedded-client-id');
   });
 });
