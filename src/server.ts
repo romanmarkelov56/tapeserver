@@ -428,12 +428,23 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
 
   async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply) {
     if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return reply.code(404).send();
-    // SoundCloud often returns the 100x100 "large" artwork variant.
-    // Prefer its 500x500 CDN variant for Tape's album and track covers.
-    const highResolutionUrl = artworkUrl.replace(/-large(?=\\.(?:jpg|jpeg|png|webp)(?:\\?|$))/i, '-t500x500');
-    const upstream = await mediaFetch(highResolutionUrl, { redirect: 'follow' });
-    const contentType = upstream.headers.get('content-type') ?? '';
-    if (!upstream.ok || !contentType.startsWith('image/')) {
+    // Artwork is served by SoundCloud's image CDN, not the audio/API host.
+    // Try the 500px variant first, then fall back to the exact URL supplied by the API.
+    const highResolutionUrl = artworkUrl.replace(/-large(?=\.(?:jpg|jpeg|png|webp)(?:\?|$))/i, '-t500x500');
+    let upstream = await mediaFetch(highResolutionUrl, {
+      redirect: 'follow',
+      headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
+    });
+    let contentType = upstream.headers.get('content-type') ?? '';
+    if ((!upstream.ok || !contentType.toLowerCase().startsWith('image/')) && highResolutionUrl !== artworkUrl) {
+      await upstream.body?.cancel().catch(() => undefined);
+      upstream = await mediaFetch(artworkUrl, {
+        redirect: 'follow',
+        headers: { accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'user-agent': 'Tape/1.0' },
+      });
+      contentType = upstream.headers.get('content-type') ?? '';
+    }
+    if (!upstream.ok || !contentType.toLowerCase().startsWith('image/')) {
       await upstream.body?.cancel().catch(() => undefined);
       return reply.code(404).send();
     }
