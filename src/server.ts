@@ -102,15 +102,22 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   let albumCache: { expiresAt: number; albums: Album[] } | null = null;
   async function albumPool(): Promise<Album[]> {
     if (albumCache && albumCache.expiresAt > Date.now()) return albumCache.albums;
+
+    // Use playlists published by SoundCloud's own editorial profile only.
+    // Public API search is free with the public client_id; it is not personalized.
+    const officialOwners = new Set(['soundcloud', 'soundcloud go', 'soundcloud charts']);
     const albums = new Map<string, Album>();
-    for (const query of ['new music', 'chill', 'indie', 'electronic']) {
-      try {
-        for (const album of await client.searchAlbums({ query, limit: 25, offset: 0 })) albums.set(album.id, album);
-      } catch {}
-      if (albums.size >= 25) break;
+    try {
+      const results = await client.searchAlbums({ query: 'SoundCloud', limit: 50, offset: 0 });
+      for (const album of results) {
+        if (officialOwners.has(album.artist.trim().toLowerCase())) albums.set(album.id, album);
+      }
+    } catch (error) {
+      console.warn('[Tape home] Unable to load SoundCloud editorial playlists:', error instanceof Error ? error.message : 'unknown error');
     }
+
     const sortedAlbums = [...albums.values()].sort((a, b) => (b.year ?? 0) - (a.year ?? 0));
-    albumCache = { albums: sortedAlbums, expiresAt: Date.now() + (albums.size ? 10 : 0.25) * 60_000 };
+    albumCache = { albums: sortedAlbums, expiresAt: Date.now() + (albums.size ? 30 : 2) * 60_000 };
     return albumCache.albums;
   }
 
@@ -138,10 +145,10 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
     !requireAuth || authenticate(request, reply, tokenService, queryToken) !== null;
 
   app.get(`${tapeApiPrefix}/public/stats`, async () => {
-    const [tracks, albums] = await Promise.all([recommendationPool(), albumPool()]);
+    const albums = await albumPool();
     const sampleAlbums = albums.slice(0, 12).map(toTapeAlbumSummary).filter((album): album is TapeAlbumSummary => album !== null);
     return {
-      tracks_count: tracks.length,
+      tracks_count: 0,
       sample_covers: sampleAlbums.map((album) => album.id),
       sample_albums: sampleAlbums,
     };
