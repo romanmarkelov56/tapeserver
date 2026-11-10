@@ -126,7 +126,7 @@ describe('Tape-compatible SoundCloud server', () => {
 
   it('falls back to a track cover when a playlist artwork URL is unavailable', async () => {
     const mock = testClient();
-    mock.client.getAlbumById = async () => ({ ...album, artworkUrl: 'https://i1.sndcdn.com/blocked-album.jpg' });
+    mock.client.getAlbumArtworkById = async () => ({ ...album, artworkUrl: 'https://i1.sndcdn.com/blocked-album.jpg' });
     mock.client.getTrackById = async () => ({ ...track, artworkUrl: 'https://i1.sndcdn.com/working-track.jpg' });
     const requested: string[] = [];
     const mediaFetch: typeof fetch = async (input) => {
