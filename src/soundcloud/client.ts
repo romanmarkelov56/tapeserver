@@ -157,6 +157,14 @@ export class SoundCloudClient {
     return items.map((item) => this.mapTrack(item)).filter((item): item is Track => item !== null);
   }
 
+  async getAlbumArtworkById(albumId: string): Promise<Album> {
+    const id = validateTrackId(albumId);
+    const raw = await this.getJson(`/playlists/${encodeURIComponent(id)}`, { show_tracks: 'false' });
+    const album = this.mapAlbum(raw);
+    if (!album) throw new SoundCloudApiError('SoundCloud returned an invalid playlist resource', 502);
+    return album;
+  }
+
   async getAlbumById(albumId: string): Promise<Album> {
     const id = validateTrackId(albumId);
     const raw = await this.getJson(`/playlists/${encodeURIComponent(id)}`, { show_tracks: 'false' });
