@@ -122,6 +122,27 @@ describe('Tape-compatible SoundCloud server', () => {
     ]);
   });
 
+  it('falls back to a track cover when a playlist artwork URL is unavailable', async () => {
+    const mock = testClient();
+    mock.client.getAlbumById = async () => ({ ...album, artworkUrl: 'https://i1.sndcdn.com/blocked-album.jpg' });
+    mock.client.getTrackById = async () => ({ ...track, artworkUrl: 'https://i1.sndcdn.com/working-track.jpg' });
+    const requested: string[] = [];
+    const mediaFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes('blocked-album')) return new Response('blocked', { status: 403 });
+      return new Response(Buffer.from('image'), { headers: { 'content-type': 'image/jpeg' } });
+    };
+    app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, mediaFetch, ...tapeAuth });
+    const response = await app.inject({ method: 'GET', url: '/api/v1/library/cover/456' });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['content-type'], 'image/jpeg');
+    assert.deepEqual(requested, [
+      'https://i1.sndcdn.com/blocked-album.jpg',
+      'https://i1.sndcdn.com/working-track.jpg',
+    ]);
+  });
+
   it('serves SoundCloud artist pages, discography, top tracks, and album tracklists', async () => {
     const mock = testClient();
     const mediaFetch: typeof fetch = async () => new Response(Buffer.from('image'), { headers: { 'content-type': 'image/jpeg' } });
