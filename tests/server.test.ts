@@ -169,6 +169,24 @@ describe('Tape-compatible SoundCloud server', () => {
     });
   });
 
+  it('builds an album page from its track when SoundCloud denies playlist access', async () => {
+    const mock = testClient();
+    mock.client.getAlbumById = async () => { throw new SoundCloudApiError('SoundCloud denied access to this resource', 403); };
+    mock.client.getTrackById = async () => ({ ...track, albumId: '456', albumTitle: 'Demo EP' });
+    app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, ...tapeAuth });
+    const accessToken = await login(app);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/library/albums/456',
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), {
+      id: 456, title: 'Demo EP', artist_id: 77, artists_display: 'Artist',
+      tracks: [{ id: 123, title: 'Demo', duration_seconds: 11, track_number: 1, artists_display: 'Artist' }],
+    });
+  });
+
   it('signs in to Tape and persists favorites locally across store restarts', async () => {
     const mock = testClient();
     const directory = await makeTempDirectory();
