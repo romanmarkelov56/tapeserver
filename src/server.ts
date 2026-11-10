@@ -447,11 +447,15 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
   app.get<{ Params: CoverParams }>(`${tapeApiPrefix}/library/cover/:id`, async (request, reply) => {
     if (tapeId(request.params.id) === null) return reply.code(404).send();
     try {
-      // Playlist artwork can be stale or inaccessible; fall back to its first track.
+      // Fetch artwork metadata only; do not load the entire playlist just to draw a cover.
       try {
-        const album = await client.getAlbumById(request.params.id);
+        const album = await client.getAlbumArtworkById(request.params.id);
         if (await sendArtwork(album.artworkUrl, reply)) return reply;
       } catch (error) {
+        if (error instanceof SoundCloudApiError && error.statusCode === 429) {
+          reply.header('Retry-After', String(error.retryAfterSeconds ?? 60));
+          return sendApiError(reply, error);
+        }
         console.warn(`[Tape artwork] Album cover lookup failed for ${request.params.id}: ${error instanceof Error ? error.message : 'unknown error'}`);
       }
       if (await sendCover(request, reply)) return reply;
