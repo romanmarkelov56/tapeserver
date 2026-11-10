@@ -18,8 +18,8 @@ export const config: AppConfig = {
   tapeJwtSecret: process.env.TAPE_JWT_SECRET ?? '',
   tapeDataDir: process.env.TAPE_DATA_DIR ?? './data',
   tapeRequireAuth: (process.env.TAPE_REQUIRE_AUTH ?? 'true').toLowerCase() !== 'false',
-  // Bind locally by default. Set HOST=0.0.0.0 only on a protected network.
-  host: process.env.HOST ?? '127.0.0.1',
+  // Render and other container hosts require binding to all network interfaces.
+  host: process.env.HOST ?? '0.0.0.0',
   port: readPort(process.env.PORT),
 };
 
