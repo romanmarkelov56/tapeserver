@@ -377,7 +377,10 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
 
   async function sendArtwork(artworkUrl: string | undefined, reply: FastifyReply) {
     if (!artworkUrl || !isTrustedArtworkUrl(artworkUrl)) return reply.code(404).send();
-    const upstream = await mediaFetch(artworkUrl, { redirect: 'follow' });
+    // SoundCloud often returns the 100x100 "large" artwork variant.
+    // Prefer its 500x500 CDN variant for Tape's album and track covers.
+    const highResolutionUrl = artworkUrl.replace(/-large(?=\\.(?:jpg|jpeg|png|webp)(?:\\?|$))/i, '-t500x500');
+    const upstream = await mediaFetch(highResolutionUrl, { redirect: 'follow' });
     const contentType = upstream.headers.get('content-type') ?? '';
     if (!upstream.ok || !contentType.startsWith('image/')) {
       await upstream.body?.cancel().catch(() => undefined);
