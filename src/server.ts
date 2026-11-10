@@ -507,7 +507,7 @@ export async function createMusicStreamerServer(options: ServerConfig = {}): Pro
       try {
         album = await client.getAlbumById(request.params.id);
       } catch (error) {
-        if (!(error instanceof SoundCloudApiError) || error.statusCode !== 404) throw error;
+        if (!(error instanceof SoundCloudApiError) || ![403, 404, 410].includes(error.statusCode)) throw error;
         const track = await client.getTrackById(request.params.id);
         album = {
           id: track.albumId ?? track.id,
