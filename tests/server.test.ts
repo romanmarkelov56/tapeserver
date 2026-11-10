@@ -102,6 +102,26 @@ describe('Tape-compatible SoundCloud server', () => {
     assert.deepEqual(mock.calls.search, { query: 'demo', limit: 8, offset: 0 });
   });
 
+  it('falls back to the original artwork URL when the 500px CDN variant is unavailable', async () => {
+    const mock = testClient();
+    mock.client.getTrackById = async () => ({ ...track, artworkUrl: 'https://i1.sndcdn.com/cover-large.jpg' });
+    const requested: string[] = [];
+    const mediaFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes('-t500x500')) return new Response('blocked', { status: 403 });
+      return new Response(Buffer.from('image'), { headers: { 'content-type': 'image/jpeg' } });
+    };
+    app = await createMusicStreamerServer({ listen: false, soundCloudClient: mock.client, mediaFetch, ...tapeAuth });
+    const response = await app.inject({ method: 'GET', url: '/api/v1/library/track-cover/123' });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['content-type'], 'image/jpeg');
+    assert.deepEqual(requested, [
+      'https://i1.sndcdn.com/cover-t500x500.jpg',
+      'https://i1.sndcdn.com/cover-large.jpg',
+    ]);
+  });
+
   it('serves SoundCloud artist pages, discography, top tracks, and album tracklists', async () => {
     const mock = testClient();
     const mediaFetch: typeof fetch = async () => new Response(Buffer.from('image'), { headers: { 'content-type': 'image/jpeg' } });
