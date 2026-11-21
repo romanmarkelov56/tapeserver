@@ -1,0 +1,94 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="style.css"></head><body>
+<header class="topbar">
+  <div class="brand">TAPE<span>/SERVER</span></div>
+  <nav id="tabs" class="tabs">
+    <button data-tab="player" class="active">Плеер</button>
+    <button data-tab="api">API</button>
+    <button data-tab="routes">Маршруты</button>
+    <button data-tab="deploy">Сервер</button>
+    <button data-tab="settings">Настройки</button>
+  </nav>
+  <div class="status" id="status">demo</div>
+</header>
+
+<main>
+  <section id="tab-player" class="panel active">
+    <form id="search-form" class="row">
+      <input id="q" placeholder="Трек, артист или ссылка soundcloud.com/…" autocomplete="off">
+      <button type="submit">Искать</button>
+    </form>
+    <div id="results" class="results"></div>
+    <div class="player">
+      <div class="now" id="now">Ничего не выбрано</div>
+      <audio id="audio" controls preload="none"></audio>
+      <div class="row">
+        <button id="btn-download" disabled>Скачать трек</button>
+        <button id="btn-copy" class="ghost" disabled>Копировать стрим-URL</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-api" class="panel">
+    <p class="hint">Ответ строится по текущей карте маршрутов. В демо-режиме данные фиктивные, после хостинга — настоящие.</p>
+    <div class="row">
+      <select id="api-method">
+        <option>GET</option>
+      </select>
+      <input id="api-path" spellcheck="false">
+      <button id="api-run">Выполнить</button>
+    </div>
+    <div class="chips" id="api-chips"></div>
+    <pre id="api-out" class="code">// пусто</pre>
+  </section>
+
+  <section id="tab-routes" class="panel">
+    <p class="hint">Пути должны совпадать с тем, что ждёт клиент Tape. Меняешь здесь — меняется и серверный код на вкладке «Сервер».</p>
+    <div id="routes-list" class="routes"></div>
+    <div class="row">
+      <button id="routes-save">Сохранить карту</button>
+      <button id="routes-reset" class="ghost">Сбросить</button>
+    </div>
+  </section>
+
+  <section id="tab-deploy" class="panel">
+    <ol class="steps">
+      <li><code>npm i express</code> в пустой папке на VPS с Node 20+</li>
+      <li>Сохранить код ниже как <code>tape-server.js</code></li>
+      <li><code>SC_CLIENT_ID=... node tape-server.js</code> (client_id не обязателен — сервер умеет доставать его сам)</li>
+      <li>В Tape указать базовый URL <code>http://IP:8080</code> и сверить маршруты</li>
+      <li>Проверить: <code>curl http://IP:8080/health</code> → <code>{"ok":true}</code></li>
+    </ol>
+    <div class="row">
+      <button id="code-copy">Копировать сервер</button>
+      <button id="code-download" class="ghost">Сохранить файлом</button>
+    </div>
+    <pre id="server-code" class="code"></pre>
+  </section>
+
+  <section id="tab-settings" class="panel">
+    <label class="field">
+      <span>client_id SoundCloud</span>
+      <input id="set-client" spellcheck="false" placeholder="32 символа, пусто = автоопределение">
+    </label>
+    <label class="field">
+      <span>Качество по умолчанию</span>
+      <select id="set-quality">
+        <option value="mp3_128">mp3_128 (совместимо)</option>
+        <option value="original">original (если доступно)</option>
+      </select>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="set-demo">
+      <span>Демо-режим (без сети)</span>
+    </label>
+    <div class="row">
+      <button id="set-save">Сохранить</button>
+      <button id="btn-scrape" class="ghost">Определить client_id</button>
+    </div>
+    <pre id="set-out" class="code"></pre>
+  </section>
+</main>
+
+<output id="toast" class="toast"></output>
+<script src="script.js"></script></body></html>
